@@ -6,14 +6,15 @@ on:
 
 jobs:
   contract-verify:
-    name: contract-verify (oracle interface rules)
+    name: contract-verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The action treats any path containing "oracle_interface" as an oracle interface (--oi).
+      # The action treats any path containing "oracle_interface" as an oracle interface (--oi);
+      # contracts/FeedRegistry.h is checked against the contract rules.
       - uses: qubic/contract-verify@v1.2.5
         with:
-          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/HttpRead.h'
+          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/HttpRead.h,contracts/FeedRegistry.h'
 
   compile:
     name: compile against qubic/core and check layouts
@@ -33,3 +34,15 @@ jobs:
       - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
       - run: check/implementation.sh
+
+  contract:
+    name: FeedRegistry contract sketch (type-check, tests, mutations)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: qubic/core
+          path: .core
+      - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+      - run: MUTATIONS=1 check/contract.sh

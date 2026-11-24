@@ -10,6 +10,7 @@ Proposed oracle interfaces for [Qubic](https://qubic.org). Three are implemented
 | [**UtxoTxRead**](designs/utxo-tx-read.md) | Read one output of a confirmed **Dogecoin**, Bitcoin or Litecoin transaction | **Implemented:** core interface 6 + `read_utxo_tx` service | 1,000 QU |
 | [**ContentRead**](designs/content-read.md) | Read a file by its SHA-256 hash: size, byte range or one JSON field | **Implemented:** core interface 7 + `read_content` service | 60–690 QU |
 | [**HttpRead**](designs/http-read.md) | Read one value from an approved public web API | Plan + draft header | 200 QU |
+| [**FeedRegistry**](designs/http-read.md#feeds-governed-by-a-registry-contract) | Contract where shareholders vote web feeds in for HttpRead's last phase | Contract sketch + 42 tests | — |
 
 ## How Qubic oracles work (what this builds on)
 
@@ -46,6 +47,16 @@ Each follows Qubic's existing EvmLogRead / `read_evm_log` pair exactly:
 
 It covers launch candidates (ECB reference rates via Frankfurter, Open-Meteo's weather archive), who decides which sources exist, and a phased roadmap. The last phase lets feeds be voted in through a FeedRegistry contract, while the fetching stays in reviewed oracle-machine code. It makes no claim to truth: a reply is what a quorum of oracle machines agreed the source said.
 
+### FeedRegistry: a contract sketch
+
+[`contracts/FeedRegistry.h`](contracts/FeedRegistry.h) is that registry written as a QPI contract, so the rules can be read as code rather than prose:
+
+- **Validation on-chain.** `https` only, a DNS host name (no IP addresses, ports or `user@`), URL-safe paths, typed placeholders, zero padding so each definition has one hash.
+- **Lifecycle.** Proposals need a deposit. Feeds go live by standard shareholder yes/no vote, which refunds the deposit. Unvoted proposals expire after 4 epochs and their deposit is burned. Feeds are retired by vote. Definitions never change.
+- **Access.** Feeds can charge per epoch and can be restricted to one contract. The proposer gets a share and shareholders get the rest as dividends.
+
+It is a sketch for discussion, not a contract proposal. The [design note](designs/http-read.md#feeds-governed-by-a-registry-contract) lists what core has to agree first, including one gap only core can close: an oracle machine isn't told which contract sent a query.
+
 ### What the patches contain
 
 Each repository gets a series of two patches, applied in order: `0001` adds EvmCallRead and UtxoTxRead, `0002` adds ContentRead.
@@ -64,6 +75,8 @@ The headers in [`oracle_interfaces/`](oracle_interfaces) are byte-for-byte the o
 ```sh
 check/implementation.sh    # clones both upstream repos, applies the patches, runs all the tests
 check/check.sh             # compiles all four headers against qubic/core, checks sizes and offsets
+check/contract.sh          # FeedRegistry: type-check against qubic/core, 42 native tests, contract-verify
+MUTATIONS=1 check/contract.sh   # ... plus the mutation check (75 deliberate bugs, each must fail a test)
 ```
 
 `implementation.sh` does five things:
@@ -74,7 +87,9 @@ check/check.sh             # compiles all four headers against qubic/core, check
 4. Builds and runs the 12 new core tests on Linux. Core's full suite is MSVC-only, but these tests only need QPI and the interface registry.
 5. Runs both services' selftests against their mock nodes.
 
-CI runs both scripts plus the official [contract-verify](https://github.com/qubic/contract-verify) action on every push.
+`contract.sh` type-checks the contract against core's real QPI headers. The tests themselves run against `contracts/test/mock_qpi.h`, a small simulation of QPI: balances, burns, dividends, shareholder voting with core's 2/3 quorum rule, and the hash map. Building a contract inside core needs MSVC.
+
+CI runs all three scripts (with the mutation check) plus the official [contract-verify](https://github.com/qubic/contract-verify) action on every push.
 
 Last local run:
 
@@ -108,7 +123,8 @@ Oracle interfaces don't go through a computor proposal or an IPO. Per core's [or
 designs/              one design note per oracle: purpose, how it works, rules, limits, tests, open questions
 oracle_interfaces/    the interface headers (drop-in format for qubic/core src/oracle_interfaces/)
 patches/              git format-patch series for qubic/core and qubic/oracle-machine (apply in order)
-check/                check.sh (headers vs core), implementation.sh (patches + all tests)
+contracts/            FeedRegistry.h (contract sketch); test/ holds its native tests, QPI mock and mutation list
+check/                check.sh (headers vs core), implementation.sh (patches + all tests), contract.sh (FeedRegistry)
 .github/workflows/    CI
 ```
 

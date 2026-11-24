@@ -109,31 +109,46 @@ Phase 1 puts every source in reviewed code, so each new feed waits for a release
 
 ### Part 1: a FeedRegistry smart contract
 
-A normal Qubic contract, proposed, voted and IPO'd like any other. It keeps the list of approved feeds.
+A normal Qubic contract, proposed, voted and IPO'd like any other. It keeps the list of approved feeds. A sketch is in [`contracts/FeedRegistry.h`](../contracts/FeedRegistry.h), with 42 native tests and a mutation check (see [Checks](../README.md#checks)). It passes contract-verify and type-checks against core's QPI headers. It has not been proposed to core.
 
-**What a feed entry holds.** Every field is fixed-size and checked when the feed is proposed:
+**What a feed definition holds.** Fixed size (396 bytes), checked when the feed is proposed, never changed afterwards:
 
 | Field | Meaning |
 |---|---|
-| `urlTemplate` (256 B) | `https://` URL with numbered placeholders, e.g. `https://api.example.org/v1/rate?day={date}&pair={0}` |
+| `urlTemplate` (256 B) | `https://` URL with placeholders `{0}`..`{3}` in the path or query, e.g. `https://api.frankfurter.app/{0}?from={1}&to={2}` |
 | `paramKinds` (4 × 1 B) | What each placeholder accepts, from a fixed list: ISO date, currency code, integer, decimal, slug (`[a-z0-9-]{1,32}`), coordinate. **No free text and no regular expressions** |
-| `timePolicy` | `historical` with a minimum age (e.g. answer only for days at least 1 day old), or `final` with the path of the source's "final" flag |
-| `valuePath` (64 B) | Field to extract from the JSON response |
-| `valueType`, `decimals` | As in the HttpRead query: decimal, text or boolean |
-| `restrictedTo` | Optional: the only contract allowed to use this feed (the "X URL for Y contract" case) |
-| `feePerUse` | Optional QU fee to the registry for each use |
-| `definitionHash` | SHA-256 of all the fields above, so a query can pin the exact version |
-| `status`, `proposer`, `deposit` | Proposed, approved or retired; who proposed it; their deposit |
+| `timePolicy`, `minAgeSeconds` | `historical`: only for moments at least `minAgeSeconds` old (1 minute to 31 days). `final`: only when the boolean at `finalPath` is true |
+| `valuePath` (64 B) | JSON pointer (RFC 6901) to the value, may use the placeholders, e.g. `/rates/{2}` |
+| `finalPath` (64 B) | `final` feeds only: JSON pointer to the source's "final" flag |
+| `valueType`, `decimals` | Integer, decimal (1 to 18 decimals, as a scaled integer), text or boolean |
 
-**Procedures (sketch):**
+**What the contract checks** before it accepts a definition:
 
-- `ProposeFeed(entry)`: anyone, with a deposit. The contract checks the entry's shape: `https` only, a host name rather than an IP address, known parameter kinds, sizes within limits. It stores the entry as proposed.
-- `VoteFeed(feedId, yes/no)`: shareholders, using QPI's existing shareholder-voting helpers. Approval sets the status to approved and returns the deposit; rejection keeps part of it.
-- `RetireFeed(feedId)`: by shareholder vote, or by the proposer. Retired entries stay readable but can't be used.
-- `UseFeed(feedId)`: called by a consumer contract before it queries, paying `feePerUse` and checking `restrictedTo`. It is optional in a first version.
-- Functions: `GetFeed(feedId)` (the entry and its hash) and `ListFeeds(start)`.
+- the URL starts with `https://`;
+- the host is a lower-case DNS name with at least one dot, and its last label is letters only. That rules out IP addresses, `localhost`, ports and `user@host`;
+- the path and query use only URL-safe characters, valid `%XX` escapes and declared placeholders, and every declared parameter is used. Placeholders can't appear in the host;
+- the parameter kinds are known and have no gaps;
+- every unused byte is zero, so a definition has exactly one encoding and one hash.
 
-**Who earns.** Fees go to shareholders and a share to the feed's proposer, which pays for curating feeds. The oracle query fee itself is still paid to the oracle as usual.
+**Around the definition** the entry stores `definitionHash` (K12 of the 396 bytes, the hash QPI offers), the proposer, an optional `restrictedTo` identity, an optional `feePerEpoch`, the deposit while pending, and the status.
+
+**Lifecycle.**
+
+| From | Event | To |
+|---|---|---|
+| | `ProposeFeed`, with the deposit (10 M QU to start) | pending |
+| pending | shareholder vote "approve feed N" accepted at the end of an epoch | approved, deposit refunded |
+| pending | no accepted vote within 4 epochs | expired, deposit burned |
+| pending | `WithdrawFeed` by the proposer | withdrawn, half the deposit refunded, half burned |
+| approved | shareholder vote "retire feed N" accepted | retired, for good |
+
+Feed ids are never reused. The same definition can't be live twice; once retired, expired or withdrawn it can be proposed again under a new id.
+
+**Votes** use QPI's standard shareholder yes/no proposals, so wallets and explorers that already show them work unchanged. Variables: approve feed, retire feed, deposit, proposer's share, proposal fee.
+
+**Access and fees.** A free, unrestricted feed is open to everyone. Otherwise a contract calls `BuyAccess(feedId, epochs)`, paying `feePerEpoch` per epoch (up to 52 ahead). The proposer gets 20% (a voted parameter, at most 50%) and the rest is paid to shareholders as dividends at the end of the epoch. A restricted feed sells access only to its `restrictedTo` identity: the "X URL for Y contract" case. Fees are per epoch rather than per use because an oracle machine can only read the registry, not charge it.
+
+**Functions:** `GetFeed`, `ListFeeds` (16 per page, filter by status), `GetAccess(feedId, user)`, `FindByHash`, `CheckDefinition` (validate and hash a definition without paying) and `GetInfo`.
 
 ### Part 2: a FeedRead oracle interface and service
 
@@ -145,6 +160,7 @@ Code pull requests to core and oracle-machine, like the other interfaces in this
 | `definitionHash` | 32 | The version of the entry the contract expects |
 | `timestamp` | 8 | The moment the value is for |
 | `params` | 128 | Up to 4 × 32-byte parameters, checked against the entry's `paramKinds` |
+| `user` | 32 | The contract the query is for, checked with `GetAccess` when the feed has a fee or a restriction |
 
 The reply has the same 160-byte shape as HttpRead.
 
@@ -152,15 +168,16 @@ The reply has the same 160-byte shape as HttpRead.
 
 1. Reads the entry by calling the registry's `GetFeed` function. Contract state is public: anyone can read it through Qubic's RPC (this is how explorers and apps show it). A machine should use its own Bob node, but it doesn't have to trust whoever serves it, because of the next step.
 2. Checks the entry is approved and that its hash equals `definitionHash`. If not, the answer is `FEED_MISMATCH`, never a fetch with a different definition. The query carries the hash, so a tampered entry from any server is rejected, the same way ContentRead rejects wrong bytes.
-3. Checks the parameters against their kinds and the timestamp against the time policy.
-4. Fills in the template and fetches under the service's **hard-coded safety policy**:
+3. If the feed has a fee or a restriction, calls `GetAccess(feedId, user)` and refuses unless it is active.
+4. Checks the parameters against their kinds and the timestamp against the time policy.
+5. Fills in the template and fetches under the service's **hard-coded safety policy**:
    - GET only;
    - the host must resolve to a public address, so no private, loopback or link-local addresses;
    - no redirects to another host;
    - size and time caps, and a rate limit per domain.
 
    A vote can't loosen any of these.
-5. Extracts the value exactly as the entry says (text-based decimals, no floating point), or abstains on any error or disagreement.
+6. Extracts the value exactly as the entry says (text-based decimals, no floating point), or abstains on any error or disagreement.
 
 ### Why this split
 
@@ -172,6 +189,7 @@ The reply has the same 160-byte shape as HttpRead.
 ### What has to be agreed first
 
 - **Oracle machines reading contract state.** The state itself is public; the new part is that an oracle service would depend on it to decide what to fetch. Today services read outside sources and Qubic logs. Because the query pins the definition by hash, a wrong or stale read can only cause a refusal, never a wrong fetch. It's still the core team's decision, and nothing should be built before that's agreed.
+- **Who sent the query.** An oracle machine is told the query id, the interface and the timeout, not which contract asked. So `user` in a FeedRead query is whatever the sender wrote, and a contract could name another contract that paid. Fees and restrictions only hold if core passes the querying contract's index to the machine, or fills `user` itself. That is a small change, but it is core's.
 - **Order of work:** the FeedRead interface and service first, against a test registry. Then the FeedRegistry contract proposal, since a registry without the oracle is useless.
 - **Responsibility:** a voted-in feed is only as good as its source. Shareholders take on the job of not approving feeds that misbehave, and of retiring ones that do.
 
