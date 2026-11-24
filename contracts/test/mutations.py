@@ -10,11 +10,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "FeedRegistry.h")
 
 # Left out on purpose, because no test can tell them apart from the original:
+# - NotifyHttpRead: the "still PENDING" check and removing the query id from queryToRequest each
+#   stop a second notification on their own, so removing either one alone changes nothing.
+# - ValidateParam: the "zero padding stays zero" scan, the currency "exactly 3" length and the
+#   "unknown kind" guard are each implied by a later check (a gap puts a zero byte inside the
+#   scanned length; ValidateParamKinds only lets kinds 1..6 through). They stay as guards.
 # - ValidateUrl "{n}" bound (>= vs >): a placeholder one past the last parameter also fails
 #   the "every parameter used exactly as declared" mask check, with the same error code.
 #   The bound stays because it keeps the shift in range.
-# - GetAccess "untilEpoch >= epoch": END_EPOCH removes entries as they run out, so a stored
-#   entry is always current. The comparison stays as a guard.
 M = [
     # definition validation
     ("input.url.get(4) != FEEDREG_CH_S", "false"),
@@ -48,14 +51,14 @@ M = [
     ("input.definition.minAgeSeconds < FEEDREG_MIN_AGE_SECONDS ||", ""),
     ("|| input.definition.minAgeSeconds > FEEDREG_MAX_AGE_SECONDS)\n            {", ")\n            {"),
     ("            if (locals.pathOut.empty)\n            {\n                output.returnCode = FEEDREG_ERR_FINAL_PATH;", "            if (false)\n            {\n                output.returnCode = FEEDREG_ERR_FINAL_PATH;"),
-    ("if (input.definition.decimals == 0 || input.definition.decimals > FEEDREG_MAX_DECIMALS)", "if (input.definition.decimals > FEEDREG_MAX_DECIMALS)"),
+    ("if (input.definition.decimals > OI::HttpRead::MAX_DECIMALS)", "if (input.definition.decimals > OI::HttpRead::MAX_DECIMALS + 1)"),
     ("            if (input.definition.decimals != 0)\n", "            if (false)\n"),
     ("if (input.definition.reserved != 0)", "if (false)"),
-    ("|| input.definition.valueType == FEEDREG_VALUE_BOOL)", "|| input.definition.valueType == FEEDREG_VALUE_BOOL || input.definition.valueType == 5)"),
+    ("|| input.definition.valueType == OI::HttpRead::ValueType::boolean)", "|| input.definition.valueType == OI::HttpRead::ValueType::boolean || input.definition.valueType == 4)"),
     # proposing
     ("if (qpi.invocationReward() < state.get().proposeDeposit)", "if (qpi.invocationReward() < state.get().proposeDeposit - 1)"),
     ("else if (state.get().feedCount >= FEEDREG_MAX_FEEDS)", "else if (false)"),
-    ("if (input.feePerEpoch < 0 || input.feePerEpoch > FEEDREG_MAX_FEE_PER_EPOCH)", "if (input.feePerEpoch > FEEDREG_MAX_FEE_PER_EPOCH)"),
+    ("if (input.feePerUse < 0 || input.feePerUse > FEEDREG_MAX_FEE_PER_USE)", "if (input.feePerUse > FEEDREG_MAX_FEE_PER_USE)"),
     ("if (state.get().liveHashes.get(output.definitionHash, locals.existing))", "if (false)"),
     ("            qpi.transfer(qpi.invocator(), qpi.invocationReward() - locals.feed.deposit);", "            qpi.transfer(qpi.invocator(), qpi.invocationReward() - locals.feed.deposit - 1);"),
     ("        state.mut().liveHashes.set(output.definitionHash, output.feedId);\n", ""),
@@ -64,17 +67,60 @@ M = [
     ("        if (locals.feed.status != FEEDREG_STATUS_PENDING)\n        {\n            output.returnCode = FEEDREG_ERR_WRONG_STATUS;", "        if (false)\n        {\n            output.returnCode = FEEDREG_ERR_WRONG_STATUS;"),
     ("output.refunded = locals.feed.deposit - locals.half;", "output.refunded = locals.half;"),
     ("        state.mut().liveHashes.removeByKey(locals.feed.definitionHash);\n        output.returnCode = FEEDREG_OK;", "        output.returnCode = FEEDREG_OK;"),
-    # access
+    # requesting values
     ("            if (locals.feed.status != FEEDREG_STATUS_APPROVED)\n            {\n                output.returnCode = FEEDREG_ERR_WRONG_STATUS;", "            if (false)\n            {\n                output.returnCode = FEEDREG_ERR_WRONG_STATUS;"),
     ("locals.feed.restrictedTo != NULL_ID && locals.feed.restrictedTo != qpi.invocator()", "false"),
-    ("if (input.epochs == 0 || input.epochs > FEEDREG_MAX_ACCESS_EPOCHS)", "if (input.epochs > FEEDREG_MAX_ACCESS_EPOCHS)"),
-    ("else if (qpi.invocationReward() < locals.cost)", "else if (false)"),
-    ("locals.until = qpi.epoch() - 1;\n", "locals.until = qpi.epoch();\n"),
-    ("if (locals.until - qpi.epoch() >= FEEDREG_MAX_ACCESS_EPOCHS)", "if (false)"),
-    ("            qpi.transfer(locals.feed.proposer, locals.proposerCut);", "            qpi.transfer(locals.feed.proposer, locals.proposerCut + 1);"),
-    ("        state.mut().dividendPool += locals.cost - locals.proposerCut;", "        state.mut().dividendPool += locals.cost;"),
-    ("        if (locals.feed.feePerEpoch == 0 && locals.feed.restrictedTo == NULL_ID)", "        if (locals.feed.feePerEpoch == 0)"),
-    ("        if (locals.feed.status != FEEDREG_STATUS_APPROVED)\n        {\n            return;\n        }\n        if (locals.feed.feePerEpoch == 0", "        if (locals.feed.feePerEpoch == 0"),
+    ("else if (!input.timestamp.isValid())", "else if (false)"),
+    ("if (input.timestamp > locals.latest)", "if (input.timestamp > qpi.now())"),
+    ("if (input.timestamp > locals.latest)", "if (input.timestamp >= locals.latest)"),
+    ("                    if (!locals.paramOut.ok)\n", "                    if (false)\n"),
+    ("                        if (locals.param.value.get(locals.i) != 0)\n", "                        if (false)\n"),
+    ("for (locals.j = 0; locals.j < 4 && output.returnCode == FEEDREG_OK; locals.j++)", "for (locals.j = 0; locals.j < 3 && output.returnCode == FEEDREG_OK; locals.j++)"),
+    ("            if (state.get().requests.get(locals.slot).status == FEEDREG_REQUEST_PENDING)", "            if (false)"),
+    ("            if (qpi.invocationReward() < locals.cost)", "            if (qpi.invocationReward() < locals.feed.feePerUse)"),
+    ("locals.cost = locals.oracleFee + locals.feed.feePerUse;", "locals.cost = locals.feed.feePerUse;"),
+    ("            if (locals.queryId < 0)\n", "            if (false)\n"),
+    ("            locals.query.endpoint = state.get().nextRequestId;\n", ""),
+    ("            locals.query.source = OI::HttpRead::getFeedRegistrySourceId();\n            locals.query.endpoint", "            locals.query.source = OI::HttpRead::getFrankfurterSourceId();\n            locals.query.endpoint"),
+    ("            locals.query.params = input.params;\n", ""),
+    ("            locals.query.decimals = locals.feed.definition.decimals;\n", ""),
+    ("        locals.req.oracleQueryId = locals.queryId;\n", ""),
+    ("        locals.req.feeHeld = locals.feed.feePerUse;\n", ""),
+    ("        state.mut().queryToRequest.set(locals.queryId, locals.req.requestId);\n", ""),
+    ("        state.mut().heldFees += locals.feed.feePerUse;\n", ""),
+    ("            qpi.transfer(qpi.invocator(), qpi.invocationReward() - locals.cost);", "            qpi.transfer(qpi.invocator(), qpi.invocationReward() - locals.cost - 1);"),
+    ("        locals.req.definitionHash = locals.feed.definitionHash;\n", ""),
+    # the oracle's answer
+    ("        if (input.status == ORACLE_QUERY_STATUS_SUCCESS)\n", "        if (input.status != ORACLE_QUERY_STATUS_TIMEOUT)\n"),
+    ("            locals.req.reply = input.reply;\n", ""),
+    ("            locals.feed.requestCount++;\n", ""),
+    ("                qpi.transfer(locals.feed.proposer, locals.proposerCut);", "                qpi.transfer(locals.feed.proposer, locals.proposerCut + 1);"),
+    ("            state.mut().dividendPool += locals.req.feeHeld - locals.proposerCut;", "            state.mut().dividendPool += locals.req.feeHeld;"),
+    ("                qpi.transfer(locals.req.requester, locals.req.feeHeld);", "                qpi.burn(locals.req.feeHeld);"),
+    ("        locals.req.answerTick = qpi.tick();\n", ""),
+    # reading requests
+    ("        if (input.requestId == 0 || locals.req.requestId != input.requestId)", "        if (input.requestId == 0)"),
+    ("        if (input.requestId == 0 || locals.req.requestId != input.requestId)", "        if (locals.req.requestId != input.requestId && input.requestId > FEEDREG_MAX_REQUESTS)"),
+    ("        output.requestCost = OI::HttpRead::getQueryFee(locals.query) + output.feed.feePerUse;", "        output.requestCost = output.feed.feePerUse;"),
+    # parameter kinds
+    ("        if (locals.len == 0)\n        {\n            return;\n        }\n\n        if (input.kind", "        if (input.kind"),
+    ("if (locals.len != 10 || input.value.get(4) != FEEDREG_CH_DASH || input.value.get(7) != FEEDREG_CH_DASH)", "if (locals.len != 10)"),
+    ("if (locals.len != 10 || input.value.get(4) != FEEDREG_CH_DASH || input.value.get(7) != FEEDREG_CH_DASH)", "if (input.value.get(4) != FEEDREG_CH_DASH || input.value.get(7) != FEEDREG_CH_DASH)"),
+    ("                if (locals.c < FEEDREG_CH_0 || locals.c > FEEDREG_CH_9)\n                {\n                    return;\n                }\n                if (locals.i < 4)", "                if (locals.i < 4)"),
+    ("            output.ok = locals.date.setIfValid(locals.year, locals.month, locals.day, 0, 0, 0);", "            output.ok = true;"),
+    ("                else if (locals.i < 7)\n", "                else if (locals.i < 6)\n"),
+    ("                if (locals.c < FEEDREG_CH_UPPER_A || locals.c > FEEDREG_CH_UPPER_Z)\n", "                if (locals.c < FEEDREG_CH_UPPER_A || locals.c > FEEDREG_CH_LOWER_Z)\n"),
+    ("                    || locals.c == FEEDREG_CH_DASH))\n", "                    || locals.c == FEEDREG_CH_DASH || locals.c == FEEDREG_CH_UNDERSCORE))\n"),
+    ("&& input.kind != FEEDREG_PARAM_INTEGER)\n", ")\n"),
+    ("            if (locals.fracDigits == 0)\n", "            if (false)\n"),
+    ("if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 18)", "if (locals.i != locals.len || locals.intDigits > 18 || locals.fracDigits > 18)"),
+    ("if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 18)", "if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 19 || locals.fracDigits > 18)"),
+    ("if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 18)", "if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 19)"),
+    ("if (locals.i != locals.len || locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 18)", "if (locals.intDigits == 0 || locals.intDigits > 18 || locals.fracDigits > 18)"),
+    ("if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))", "if (locals.fracDigits > 4 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))"),
+    ("if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))", "if (locals.intDigits > 3 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))"),
+    ("if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))", "if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 181 || (locals.intValue == 180 && locals.fracNonZero))"),
+    ("if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 180 || (locals.intValue == 180 && locals.fracNonZero))", "if (locals.intDigits > 3 || locals.fracDigits > 4 || locals.intValue > 180)"),
     # governance
     ("locals.valid = qpi.invocationReward() >= state.get().proposalFee;", "locals.valid = true;"),
     ("&& input.data.variableOptions.variable < FEEDREG_VARIABLE_COUNT", ""),
@@ -94,7 +140,6 @@ M = [
     ("qpi.epoch() + 1 < locals.feed.proposedEpoch + FEEDREG_PENDING_EPOCHS", "qpi.epoch() + 2 < locals.feed.proposedEpoch + FEEDREG_PENDING_EPOCHS"),
     ("                qpi.burn(locals.feed.deposit);\n            }\n            locals.feed.deposit = 0;\n            locals.feed.status = FEEDREG_STATUS_EXPIRED;", "            }\n            locals.feed.deposit = 0;\n            locals.feed.status = FEEDREG_STATUS_EXPIRED;"),
     ("            state.mut().dividendPool -= locals.perShare * NUMBER_OF_COMPUTORS;\n", ""),
-    ("if (state.get().access.value(locals.elementIndex) <= qpi.epoch())", "if (state.get().access.value(locals.elementIndex) < qpi.epoch())"),
     # listing
     ("            if (output.count == FEEDREG_LIST_PAGE)\n            {\n                output.nextFeedId = locals.i;", "            if (output.count == FEEDREG_LIST_PAGE)\n            {\n                output.nextFeedId = locals.i + 1;"),
     ("            if (input.status != 0 && locals.feed.status != input.status)", "            if (false)"),

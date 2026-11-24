@@ -118,6 +118,23 @@ struct HttpRead
         return id(o, p, e, n, m, e, t, e, o, underscore, a, r);
     }
 
+    /// Source: a feed approved in the FeedRegistry contract (contracts/FeedRegistry.h). Only the
+    /// registry sends these queries; for this source the query fields mean:
+    ///   endpoint            the registry's request id
+    ///   timestamp, params   as the registry recorded them for that request
+    ///   field               unused, all zero
+    ///   valueType, decimals the feed's
+    /// The oracle machine reads the request with the registry's GetRequest function and serves the
+    /// query only if the request is pending, its oracleQueryId is this query's id, its timestamp and
+    /// params equal the query's, and the feed's stored definition hashes to the request's
+    /// definitionHash. Otherwise it answers RESULT_SOURCE_UNSUPPORTED. The URL, the value path and the
+    /// time policy come from that definition.
+    static id getFeedRegistrySourceId()
+    {
+        using namespace Ch;
+        return id(f, e, e, d, r, e, g);
+    }
+
     /// True if the reply carries a value.
     static bool replyIsValid(const OracleReply& reply)
     {

@@ -20,7 +20,7 @@ fi
 echo "== Type-checking against $(git -C "$CORE" log -1 --format='qubic/core %h (%cs)' 2>/dev/null || echo "$CORE")"
 ${CXX:-g++} -std=c++20 -fsyntax-only -mavx2 -w \
   -I "$CORE" -I "$CORE/src" -I "$CORE/lib/platform_common" -I "$CORE/lib/platform_os" \
-  -I contracts check/feed_registry_core.cpp
+  -I contracts -I oracle_interfaces check/feed_registry_core.cpp
 echo "ok"
 
 echo "== Native tests"

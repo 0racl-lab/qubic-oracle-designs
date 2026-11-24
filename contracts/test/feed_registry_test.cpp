@@ -1,6 +1,7 @@
 // Native tests for FeedRegistry.h against mock_qpi.h.
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 #include "mock_qpi.h"
 #include "FeedRegistry.h"
 
@@ -26,7 +27,7 @@ static R::FeedDefinition frankfurter()
     d.paramKinds.set(2, FEEDREG_PARAM_CURRENCY);
     d.timePolicy = FEEDREG_TIME_HISTORICAL;
     d.minAgeSeconds = 86400;
-    d.valueType = FEEDREG_VALUE_DECIMAL;
+    d.valueType = OI::HttpRead::ValueType::decimal;
     d.decimals = 6;
     return d;
 }
@@ -75,15 +76,15 @@ struct H
         R::NAME##_output out; memset(&out, 0, sizeof(out)); \
         QpiCtx q{NULL_ID, 0}; auto inCopy = in; auto* l = (R::NAME##_locals*)calloc(1, sizeof(R::NAME##_locals)); R::NAME(q, cs, inCopy, out, *l); free(l); return out; \
     }
-    P(ProposeFeed) P(WithdrawFeed) P(BuyAccess) P(SetShareholderProposal) P(SetShareholderVotes)
-    F(GetFeed) F(ListFeeds) F(GetAccess) F(FindByHash) F(CheckDefinition) F(GetInfo) F(GetShareholderProposal)
+    P(ProposeFeed) P(WithdrawFeed) P(RequestValue) P(SetShareholderProposal) P(SetShareholderVotes)
+    F(GetFeed) F(ListFeeds) F(GetRequest) F(FindByHash) F(CheckDefinition) F(GetInfo) F(GetShareholderProposal)
 
     uint32 check(const R::FeedDefinition& d) { R::CheckDefinition_input in{}; in.definition = d; return CheckDefinition(in).returnCode; }
 
     R::ProposeFeed_output propose(const R::FeedDefinition& d, const id& who = ALICE, sint64 fee = 0, const id& restrictedTo = NULL_ID, sint64 pay = FEEDREG_DEFAULT_DEPOSIT)
     {
         R::ProposeFeed_input in; memset(&in, 0, sizeof(in));
-        in.definition = d; in.feePerEpoch = fee; in.restrictedTo = restrictedTo;
+        in.definition = d; in.feePerUse = fee; in.restrictedTo = restrictedTo;
         return ProposeFeed(in, who, pay);
     }
     R::Feed feed(uint64 feedId) { R::GetFeed_input in{feedId}; auto o = GetFeed(in); EXPECT_EQ(o.returnCode, FEEDREG_OK); return o.feed; }
@@ -125,18 +126,38 @@ struct H
         EXPECT_EQ(status(o.feedId), FEEDREG_STATUS_APPROVED);
         return o.feedId;
     }
-    R::BuyAccess_output buy(uint64 feedId, uint16 epochs, const id& who = CONSUMER, sint64 pay = -1)
+    R::RequestValue_output request(uint64 feedId, const DateAndTime& when, const std::vector<std::string>& params, const id& who = CONSUMER, sint64 pay = -1)
     {
-        R::BuyAccess_input in{feedId, epochs};
-        if (pay < 0) pay = feed(feedId).feePerEpoch * epochs;
-        return BuyAccess(in, who, pay);
+        R::RequestValue_input in; memset((void*)&in, 0, sizeof(in));
+        in.feedId = feedId; in.timestamp = when;
+        for (size_t j = 0; j < params.size() && j < 4; j++)
+            for (size_t i = 0; i < params[j].size() && i < 32; i++) in.params.set(j * 32 + i, (uint8)params[j][i]);
+        if (pay < 0) { R::GetFeed_input gi{feedId}; pay = GetFeed(gi).requestCost; }
+        return RequestValue(in, who, pay);
     }
-    R::GetAccess_output access(uint64 feedId, const id& user) { R::GetAccess_input in{}; in.feedId = feedId; in.user = user; return GetAccess(in); }
+    R::Request req(uint64 requestId) { R::GetRequest_input in{requestId}; auto o = GetRequest(in); EXPECT_EQ(o.returnCode, FEEDREG_OK); return o.request; }
+    // the oracle engine calling back
+    void notify(sint64 queryId, uint8 status, sint64 value = 0, uint64 code = OI::HttpRead::RESULT_SUCCESS)
+    {
+        R::NotifyHttpRead_input in; memset((void*)&in, 0, sizeof(in));
+        in.queryId = queryId; in.subscriptionId = -1; in.status = status;
+        if (status == ORACLE_QUERY_STATUS_SUCCESS) { in.reply.code = code; in.reply.valueType = OI::HttpRead::ValueType::decimal; in.reply.intValue = code ? 0 : value; }
+        R::NotifyHttpRead_output out;
+        QpiCtx q{NULL_ID, 0}; auto* l = (R::NotifyHttpRead_locals*)calloc(1, sizeof(R::NotifyHttpRead_locals)); R::NotifyHttpRead(q, cs, in, out, *l); free(l);
+    }
+    sint64 lastQueryId() { return chain().queries.back().queryId; }
 
     // the contract never holds QU it cannot account for
     void invariant()
     {
-        EXPECT_EQ(bal(MOCK_CONTRACT_ID), s->heldDeposits + s->dividendPool);
+        EXPECT_EQ(bal(MOCK_CONTRACT_ID), s->heldDeposits + s->heldFees + s->dividendPool);
+        sint64 fees = 0;
+        for (uint64 i = 0; i < FEEDREG_MAX_REQUESTS; i++)
+        {
+            R::Request r = s->requests.get(i);
+            if (r.status == FEEDREG_REQUEST_PENDING) fees += r.feeHeld; else EXPECT_EQ(r.feeHeld, 0);
+        }
+        EXPECT_EQ(fees, s->heldFees);
         sint64 held = 0;
         for (uint64 i = 0; i < s->feedCount; i++)
         {
@@ -317,20 +338,20 @@ TEST(Definition, TimePolicy)
     EXPECT_EQ(h.check(d), FEEDREG_OK);
 }
 
-TEST(Definition, ValueType)
+TEST(Definition, ValueTypeFollowsHttpRead)
 {
     H h;
     R::FeedDefinition d = frankfurter();
-    d.decimals = 0; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
-    d.decimals = FEEDREG_MAX_DECIMALS; EXPECT_EQ(h.check(d), FEEDREG_OK);
-    d.decimals = FEEDREG_MAX_DECIMALS + 1; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
-    for (uint8 t : {FEEDREG_VALUE_INTEGER, FEEDREG_VALUE_TEXT, FEEDREG_VALUE_BOOL})
+    d.decimals = 0; EXPECT_EQ(h.check(d), FEEDREG_OK);                     // whole numbers
+    d.decimals = OI::HttpRead::MAX_DECIMALS; EXPECT_EQ(h.check(d), FEEDREG_OK);
+    d.decimals = OI::HttpRead::MAX_DECIMALS + 1; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
+    for (uint8 t : {(uint8)OI::HttpRead::ValueType::text, (uint8)OI::HttpRead::ValueType::boolean})
     {
         d.valueType = t; d.decimals = 0; EXPECT_EQ(h.check(d), FEEDREG_OK);
         d.decimals = 2; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
     }
     d.valueType = 0; d.decimals = 0; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
-    d.valueType = 5; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
+    d.valueType = 4; EXPECT_EQ(h.check(d), FEEDREG_ERR_VALUE_TYPE);
 }
 
 TEST(Definition, ReservedByteMustBeZero)
@@ -354,7 +375,7 @@ TEST(Propose, StoresFeedHoldsDepositRefundsExcess)
     EXPECT_EQ(f.status, FEEDREG_STATUS_PENDING);
     EXPECT_EQ(f.proposer, ALICE);
     EXPECT_EQ(f.deposit, FEEDREG_DEFAULT_DEPOSIT);
-    EXPECT_EQ(f.feePerEpoch, 500);
+    EXPECT_EQ(f.feePerUse, 500);
     EXPECT_EQ(f.proposedEpoch, chain().epoch);
     EXPECT_EQ(f.definitionHash, o.definitionHash);
     R::FeedDefinition want = frankfurter();
@@ -374,13 +395,13 @@ TEST(Propose, RejectsAndRefundsEverything)
     EXPECT_EQ(h.propose(frankfurter(), ALICE, 0, NULL_ID, FEEDREG_DEFAULT_DEPOSIT - 1).returnCode, FEEDREG_ERR_DEPOSIT);
     EXPECT_EQ(h.propose(withUrl("http://example.com/x"), ALICE, 0, NULL_ID, FEEDREG_DEFAULT_DEPOSIT * 3).returnCode, FEEDREG_ERR_URL_SCHEME);
     EXPECT_EQ(h.propose(frankfurter(), ALICE, -1).returnCode, FEEDREG_ERR_FEE);
-    EXPECT_EQ(h.propose(frankfurter(), ALICE, FEEDREG_MAX_FEE_PER_EPOCH + 1).returnCode, FEEDREG_ERR_FEE);
+    EXPECT_EQ(h.propose(frankfurter(), ALICE, FEEDREG_MAX_FEE_PER_USE + 1).returnCode, FEEDREG_ERR_FEE);
     auto o = h.propose(withUrl("http://x.com/a"));
     EXPECT_EQ(o.feedId, 0u);
     EXPECT_EQ(o.definitionHash, NULL_ID);
     EXPECT_EQ(bal(ALICE), before);
     EXPECT_EQ(h.s->feedCount, 0u);
-    EXPECT_EQ(h.propose(frankfurter(), ALICE, FEEDREG_MAX_FEE_PER_EPOCH).returnCode, FEEDREG_OK);
+    EXPECT_EQ(h.propose(frankfurter(), ALICE, FEEDREG_MAX_FEE_PER_USE).returnCode, FEEDREG_OK);
     h.invariant();
 }
 
@@ -554,10 +575,10 @@ TEST(Governance, InvalidProposalsAreRefused)
     EXPECT_EQ(h.openVote(FEEDREG_VAR_PROPOSAL_FEE, FEEDREG_MAX_PROPOSAL_FEE + 1), INVALID_PROPOSAL_INDEX);
     EXPECT_EQ(h.openVote(FEEDREG_VARIABLE_COUNT, 1), INVALID_PROPOSAL_INDEX);
     EXPECT_EQ(h.openVote(FEEDREG_VAR_DEPOSIT, -5), INVALID_PROPOSAL_INDEX);
-    EXPECT_EQ(h.openVote(FEEDREG_VAR_DEPOSIT, 5000, SH1, FEEDREG_DEFAULT_PROPOSAL_FEE - 1), INVALID_PROPOSAL_INDEX);  // fee short
+    EXPECT_EQ(h.openVote(FEEDREG_VAR_DEPOSIT, 20000000, SH1, FEEDREG_DEFAULT_PROPOSAL_FEE - 1), INVALID_PROPOSAL_INDEX);  // fee short
     EXPECT_EQ(bal(SH1), before);
     sint64 c = bal(CAROL);
-    EXPECT_EQ(h.openVote(FEEDREG_VAR_DEPOSIT, 5000, CAROL), INVALID_PROPOSAL_INDEX);             // not a shareholder
+    EXPECT_EQ(h.openVote(FEEDREG_VAR_DEPOSIT, 20000000, CAROL), INVALID_PROPOSAL_INDEX);             // not a shareholder
     EXPECT_EQ(bal(CAROL), c);
     R::SetShareholderProposal_input yn; memset((void*)&yn, 0, sizeof(yn));
     yn.epoch = chain().epoch; yn.type = ProposalTypes::YesNo;
@@ -571,7 +592,7 @@ TEST(Governance, ProposalFeeExcessIsRefunded)
 {
     H h;
     sint64 before = bal(SH1);
-    EXPECT_NE(h.openVote(FEEDREG_VAR_DEPOSIT, 5000, SH1, FEEDREG_DEFAULT_PROPOSAL_FEE + 77), INVALID_PROPOSAL_INDEX);
+    EXPECT_NE(h.openVote(FEEDREG_VAR_DEPOSIT, 20000000, SH1, FEEDREG_DEFAULT_PROPOSAL_FEE + 77), INVALID_PROPOSAL_INDEX);
     EXPECT_EQ(bal(SH1), before - FEEDREG_DEFAULT_PROPOSAL_FEE);
     EXPECT_EQ(chain().burned, FEEDREG_DEFAULT_PROPOSAL_FEE);
 }
@@ -583,8 +604,7 @@ TEST(Governance, RetireFreesTheDefinition)
     h.pass(FEEDREG_VAR_RETIRE_FEED, (sint64)id1);
     h.endEpoch();
     EXPECT_EQ(h.status(id1), FEEDREG_STATUS_RETIRED);
-    EXPECT_FALSE(h.access(id1, CONSUMER).active);
-    EXPECT_EQ(h.buy(id1, 1).returnCode, FEEDREG_ERR_WRONG_STATUS);
+    EXPECT_EQ(h.request(id1, DateAndTime(2026, 11, 20), {"2026-11-20", "EUR", "USD"}).returnCode, FEEDREG_ERR_WRONG_STATUS);
     EXPECT_EQ(h.openVote(FEEDREG_VAR_RETIRE_FEED, (sint64)id1), INVALID_PROPOSAL_INDEX);
     EXPECT_EQ(h.openVote(FEEDREG_VAR_APPROVE_FEED, (sint64)id1), INVALID_PROPOSAL_INDEX);       // no way back
     EXPECT_EQ(h.propose(frankfurter()).feedId, 2u);              // can be proposed afresh
@@ -594,7 +614,7 @@ TEST(Governance, RetireFreesTheDefinition)
 TEST(Governance, ParametersChangeByVote)
 {
     H h;
-    h.pass(FEEDREG_VAR_DEPOSIT, 5000);
+    h.pass(FEEDREG_VAR_DEPOSIT, 20000000);
     h.endEpoch();
     h.pass(FEEDREG_VAR_PROPOSER_SHARE_BPS, 0);
     h.endEpoch();
@@ -602,12 +622,12 @@ TEST(Governance, ParametersChangeByVote)
     h.endEpoch();
     R::GetInfo_input gi{};
     auto info = h.GetInfo(gi);
-    EXPECT_EQ(info.proposeDeposit, 5000);
+    EXPECT_EQ(info.proposeDeposit, 20000000);
     EXPECT_EQ(info.proposerShareBps, 0);
     EXPECT_EQ(info.proposalFee, 0);
-    auto o = h.propose(frankfurter(), ALICE, 0, NULL_ID, 5000);
+    auto o = h.propose(frankfurter(), ALICE, 0, NULL_ID, 20000000);
     EXPECT_EQ(o.returnCode, FEEDREG_OK);
-    EXPECT_EQ(h.feed(o.feedId).deposit, 5000);
+    EXPECT_EQ(h.feed(o.feedId).deposit, 20000000);
     EXPECT_NE(h.openVote(FEEDREG_VAR_APPROVE_FEED, (sint64)o.feedId, SH1, 0), INVALID_PROPOSAL_INDEX);
     h.invariant();
 }
@@ -616,7 +636,7 @@ TEST(Governance, DepositChangeDoesNotTouchHeldDeposits)
 {
     H h;
     auto o = h.propose(frankfurter());
-    h.pass(FEEDREG_VAR_DEPOSIT, 5000);
+    h.pass(FEEDREG_VAR_DEPOSIT, 20000000);
     h.endEpoch();
     h.pass(FEEDREG_VAR_APPROVE_FEED, (sint64)o.feedId);
     sint64 before = bal(ALICE);
@@ -625,129 +645,298 @@ TEST(Governance, DepositChangeDoesNotTouchHeldDeposits)
     h.invariant();
 }
 
-// ============================================================ access
+// ============================================================ requesting values
 
-TEST(Access, PendingFeedHasNoAccess)
+static const DateAndTime NOV20 = DateAndTime(2026, 11, 20);
+static const std::vector<std::string> EURUSD = {"2026-11-20", "EUR", "USD"};
+
+TEST(Request, SendsHttpReadQueryAndRecordsIt)
 {
     H h;
-    auto o = h.propose(frankfurter(), ALICE, 0);
-    EXPECT_FALSE(h.access(o.feedId, CONSUMER).active);
-    sint64 before = bal(CONSUMER);
-    EXPECT_EQ(h.buy(o.feedId, 1, CONSUMER, 10).returnCode, FEEDREG_ERR_WRONG_STATUS);
-    EXPECT_EQ(bal(CONSUMER), before);
-    EXPECT_EQ(h.buy(99, 1, CONSUMER, 0).returnCode, FEEDREG_ERR_NOT_FOUND);
-    EXPECT_FALSE(h.access(99, CONSUMER).active);
-    EXPECT_FALSE(h.access(0, CONSUMER).active);
+    uint64 f = h.approved(frankfurter(), 1000);
+    R::GetFeed_input gi{f};
+    EXPECT_EQ(h.GetFeed(gi).requestCost, 200 + 1000);
+    sint64 consumer = bal(CONSUMER);
+    auto o = h.request(f, NOV20, EURUSD, CONSUMER, 1200 + 99);           // 99 too much
+    ASSERT_EQ(o.returnCode, FEEDREG_OK);
+    EXPECT_EQ(o.requestId, 1u);
+    EXPECT_EQ(o.charged, 1200);
+    EXPECT_EQ(bal(CONSUMER), consumer - 1200);
+    EXPECT_EQ(chain().oracleFeesPaid, 200);
+    EXPECT_EQ(h.s->heldFees, 1000);
+
+    ASSERT_EQ(chain().queries.size(), 1u);
+    const auto& q = chain().queries.back();
+    EXPECT_EQ(q.query.source, OI::HttpRead::getFeedRegistrySourceId());
+    EXPECT_EQ(q.query.endpoint, o.requestId);
+    EXPECT_EQ(q.query.timestamp, NOV20);
+    EXPECT_EQ(q.query.valueType, OI::HttpRead::ValueType::decimal);
+    EXPECT_EQ(q.query.decimals, 6u);
+    EXPECT_EQ(q.query.params.get(32), 'E');
+    EXPECT_EQ(q.query.params.get(64 + 2), 'D');
+    for (int i = 0; i < 64; i++) EXPECT_EQ(q.query.field.get(i), 0);
+    EXPECT_EQ(q.timeoutMs, FEEDREG_ORACLE_TIMEOUT_MS);
+
+    R::Request r = h.req(o.requestId);
+    EXPECT_EQ(r.status, FEEDREG_REQUEST_PENDING);
+    EXPECT_EQ(r.feedId, f);
+    EXPECT_EQ(r.requester, CONSUMER);
+    EXPECT_EQ(r.definitionHash, h.feed(f).definitionHash);
+    EXPECT_EQ(r.oracleQueryId, q.queryId);               // what the oracle machine matches against
+    EXPECT_EQ(r.timestamp, NOV20);
+    EXPECT_EQ(0, memcmp(&r.params, &q.query.params, sizeof(r.params)));
+    EXPECT_EQ(r.feeHeld, 1000);
+    EXPECT_EQ(h.request(f, NOV20, EURUSD).requestId, 2u);
+    h.invariant();
 }
 
-TEST(Access, FreeOpenFeedNeedsNoPurchase)
+TEST(Request, AnswerPaysProposerAndShareholders)
+{
+    H h;
+    uint64 f = h.approved(frankfurter(), 1000);
+    auto o = h.request(f, NOV20, EURUSD);
+    sint64 alice = bal(ALICE);
+    h.notify(h.lastQueryId(), ORACLE_QUERY_STATUS_SUCCESS, 1053200);
+    R::Request r = h.req(o.requestId);
+    EXPECT_EQ(r.status, FEEDREG_REQUEST_ANSWERED);
+    EXPECT_EQ(r.reply.code, OI::HttpRead::RESULT_SUCCESS);
+    EXPECT_EQ(r.reply.intValue, 1053200);                // 1.0532 USD per EUR, 6 decimals
+    EXPECT_EQ(r.feeHeld, 0);
+    EXPECT_EQ(r.answerTick, chain().tick);
+    EXPECT_EQ(bal(ALICE), alice + 200);                  // 20% of the feed fee
+    EXPECT_EQ(h.s->dividendPool, 800);
+    EXPECT_EQ(h.s->heldFees, 0);
+    EXPECT_EQ(h.feed(f).requestCount, 1u);
+    h.invariant();
+    h.notify(h.lastQueryId(), ORACLE_QUERY_STATUS_SUCCESS, 1);    // a repeat changes nothing
+    EXPECT_EQ(h.req(o.requestId).reply.intValue, 1053200);
+    EXPECT_EQ(bal(ALICE), alice + 200);
+    h.endEpoch();
+    EXPECT_EQ(chain().dividends, 676);                   // 1 QU per share; 124 stay in the pool
+    EXPECT_EQ(h.s->dividendPool, 124);
+    h.invariant();
+}
+
+TEST(Request, SourceSaysNoDataStillCountsAsAnswered)
+{
+    H h;
+    uint64 f = h.approved(frankfurter(), 1000);
+    auto o = h.request(f, NOV20, EURUSD);
+    h.notify(h.lastQueryId(), ORACLE_QUERY_STATUS_SUCCESS, 0, OI::HttpRead::RESULT_NO_DATA);
+    R::Request r = h.req(o.requestId);
+    EXPECT_EQ(r.status, FEEDREG_REQUEST_ANSWERED);
+    EXPECT_EQ(r.reply.code, OI::HttpRead::RESULT_NO_DATA);
+    EXPECT_EQ(h.s->dividendPool, 800);                   // the source was read; the fee is earned
+    h.invariant();
+}
+
+TEST(Request, NoAnswerRefundsTheFeedFeeOnly)
+{
+    for (uint8 status : {ORACLE_QUERY_STATUS_TIMEOUT, ORACLE_QUERY_STATUS_UNRESOLVABLE})
+    {
+        H h;
+        uint64 f = h.approved(frankfurter(), 1000);
+        sint64 consumer = bal(CONSUMER), alice = bal(ALICE);
+        auto o = h.request(f, NOV20, EURUSD);
+        h.notify(h.lastQueryId(), status);
+        R::Request r = h.req(o.requestId);
+        EXPECT_EQ(r.status, FEEDREG_REQUEST_NOT_ANSWERED);
+        EXPECT_EQ(r.reply.code, 0u);
+        EXPECT_EQ(bal(CONSUMER), consumer - 200);        // the oracle fee is gone, the feed fee is back
+        EXPECT_EQ(bal(ALICE), alice);
+        EXPECT_EQ(h.s->dividendPool, 0);
+        EXPECT_EQ(h.feed(f).requestCount, 0u);
+        h.invariant();
+    }
+}
+
+TEST(Request, UnknownNotificationIsIgnored)
+{
+    H h;
+    uint64 f = h.approved(frankfurter(), 1000);
+    auto o = h.request(f, NOV20, EURUSD);
+    h.notify(h.lastQueryId() + 1, ORACLE_QUERY_STATUS_SUCCESS, 5);
+    EXPECT_EQ(h.req(o.requestId).status, FEEDREG_REQUEST_PENDING);
+    h.invariant();
+}
+
+TEST(Request, FreeFeedCostsOnlyTheOracleFee)
 {
     H h;
     uint64 f = h.approved(frankfurter());
-    auto a = h.access(f, CONSUMER);
-    EXPECT_TRUE(a.active);
-    EXPECT_EQ(a.untilEpoch, 65535);
+    auto o = h.request(f, NOV20, EURUSD, CONSUMER, 200);
+    EXPECT_EQ(o.returnCode, FEEDREG_OK);
+    EXPECT_EQ(o.charged, 200);
+    h.notify(h.lastQueryId(), ORACLE_QUERY_STATUS_SUCCESS, 7);
+    EXPECT_EQ(h.s->dividendPool, 0);
+    h.invariant();
 }
 
-TEST(Access, PaidFeedSplitsFeeAndExpires)
+TEST(Request, RefusalsRefundEverything)
 {
     H h;
     uint64 f = h.approved(frankfurter(), 1000);
-    EXPECT_FALSE(h.access(f, CONSUMER).active);
-    sint64 alice = bal(ALICE), consumer = bal(CONSUMER);
-    uint16 e = chain().epoch;
-    auto o = h.buy(f, 3, CONSUMER, 3000 + 50);                     // 50 too much
-    ASSERT_EQ(o.returnCode, FEEDREG_OK);
-    EXPECT_EQ(o.paid, 3000);
-    EXPECT_EQ(o.untilEpoch, e + 2);                                // this epoch and the next two
-    EXPECT_EQ(bal(CONSUMER), consumer - 3000);
-    EXPECT_EQ(bal(ALICE), alice + 600);                            // 20% to the proposer
-    EXPECT_EQ(h.s->dividendPool, 2400);
-    h.invariant();
-    EXPECT_TRUE(h.access(f, CONSUMER).active);
-    EXPECT_FALSE(h.access(f, CONSUMER2).active);
-    h.endEpoch();
-    EXPECT_EQ(h.s->dividendPool, 2400 - 676 * 3);                  // 3 QU per share paid out
-    EXPECT_EQ(chain().dividends, 676 * 3);
-    EXPECT_TRUE(h.access(f, CONSUMER).active);
-    h.endEpoch();
-    EXPECT_TRUE(h.access(f, CONSUMER).active);
-    h.endEpoch();
-    EXPECT_FALSE(h.access(f, CONSUMER).active);
-    EXPECT_EQ(h.s->access.population(), 0u);                       // swept
-    h.invariant();
-}
-
-TEST(Access, ExtendingAddsToTheEnd)
-{
-    H h;
-    uint64 f = h.approved(frankfurter(), 10);
-    uint16 e = chain().epoch;
-    EXPECT_EQ(h.buy(f, 2).untilEpoch, e + 1);
-    EXPECT_EQ(h.buy(f, 3).untilEpoch, e + 4);
-    h.endEpoch();
-    EXPECT_EQ(h.buy(f, 1).untilEpoch, e + 5);
-    EXPECT_EQ(h.buy(f, FEEDREG_MAX_ACCESS_EPOCHS).returnCode, FEEDREG_ERR_EPOCHS);   // more than 52 ahead
-    EXPECT_EQ(h.access(f, CONSUMER).untilEpoch, e + 5);
-    h.invariant();
-}
-
-TEST(Access, BadPurchasesAreRefunded)
-{
-    H h;
-    uint64 f = h.approved(frankfurter(), 1000);
+    auto pending = h.propose(withUrl("https://example.com/x"));
     sint64 before = bal(CONSUMER);
-    EXPECT_EQ(h.buy(f, 2, CONSUMER, 1999).returnCode, FEEDREG_ERR_PAYMENT);
-    EXPECT_EQ(h.buy(f, 0, CONSUMER, 5).returnCode, FEEDREG_ERR_EPOCHS);
-    EXPECT_EQ(h.buy(f, FEEDREG_MAX_ACCESS_EPOCHS + 1).returnCode, FEEDREG_ERR_EPOCHS);
-    EXPECT_EQ(h.buy(f, 65535, CONSUMER, 0).returnCode, FEEDREG_ERR_EPOCHS);
+    EXPECT_EQ(h.request(99, NOV20, EURUSD, CONSUMER, 5000).returnCode, FEEDREG_ERR_NOT_FOUND);
+    EXPECT_EQ(h.request(0, NOV20, EURUSD, CONSUMER, 5000).returnCode, FEEDREG_ERR_NOT_FOUND);
+    EXPECT_EQ(h.request(pending.feedId, NOV20, {}, CONSUMER, 5000).returnCode, FEEDREG_ERR_WRONG_STATUS);
+    EXPECT_EQ(h.request(f, DateAndTime(), EURUSD, CONSUMER, 5000).returnCode, FEEDREG_ERR_TIMESTAMP);
+    EXPECT_EQ(h.request(f, NOV20, EURUSD, CONSUMER, 1199).returnCode, FEEDREG_ERR_PAYMENT);
+    chain().oracleRejects = true;
+    EXPECT_EQ(h.request(f, NOV20, EURUSD, CONSUMER, 5000).returnCode, FEEDREG_ERR_ORACLE_REFUSED);
+    chain().oracleRejects = false;
     EXPECT_EQ(bal(CONSUMER), before);
-    EXPECT_EQ(h.buy(f, FEEDREG_MAX_ACCESS_EPOCHS).returnCode, FEEDREG_OK);
+    EXPECT_EQ(chain().queries.size(), 0u);
+    EXPECT_EQ(h.s->nextRequestId, 1u);
     h.invariant();
 }
 
-TEST(Access, RestrictedFeedServesOnlyItsUser)
+TEST(Request, MinimumAgeOfTheRequestedMoment)
+{
+    H h;
+    uint64 f = h.approved(frankfurter());                // minAgeSeconds = 86400
+    DateAndTime edge = chain().now; edge.add(0, 0, -1, 0, 0, 0);
+    DateAndTime late = edge; late.add(0, 0, 0, 0, 0, 1);
+    EXPECT_EQ(h.request(f, late, EURUSD).returnCode, FEEDREG_ERR_TOO_RECENT);
+    EXPECT_EQ(h.request(f, chain().now, EURUSD).returnCode, FEEDREG_ERR_TOO_RECENT);
+    EXPECT_EQ(h.request(f, edge, EURUSD).returnCode, FEEDREG_OK);
+    DateAndTime future = chain().now; future.add(0, 0, 3, 0, 0, 0);
+    EXPECT_EQ(h.request(f, future, EURUSD).returnCode, FEEDREG_ERR_TOO_RECENT);
+    h.invariant();
+}
+
+TEST(Request, FinalFeedWithoutMinimumAgeAcceptsNow)
+{
+    H h;
+    R::FeedDefinition d = frankfurter();
+    d.timePolicy = FEEDREG_TIME_FINAL; d.minAgeSeconds = 0; put(d.finalPath, "/final");
+    uint64 f = h.approved(d);
+    EXPECT_EQ(h.request(f, chain().now, EURUSD).returnCode, FEEDREG_OK);
+    DateAndTime soon = chain().now; soon.add(0, 0, 0, 0, 0, 1);
+    EXPECT_EQ(h.request(f, soon, EURUSD).returnCode, FEEDREG_ERR_TOO_RECENT);
+}
+
+TEST(Request, RestrictedFeedServesOnlyItsContract)
 {
     H h;
     uint64 f = h.approved(frankfurter(), 0, CONSUMER);
-    EXPECT_FALSE(h.access(f, CONSUMER).active);                    // even the named user registers first
     sint64 before = bal(CONSUMER2);
-    EXPECT_EQ(h.buy(f, 1, CONSUMER2, 100).returnCode, FEEDREG_ERR_RESTRICTED);
+    EXPECT_EQ(h.request(f, NOV20, EURUSD, CONSUMER2).returnCode, FEEDREG_ERR_RESTRICTED);
     EXPECT_EQ(bal(CONSUMER2), before);
-    EXPECT_EQ(h.buy(f, 1, CONSUMER).returnCode, FEEDREG_OK);
-    EXPECT_TRUE(h.access(f, CONSUMER).active);
-    EXPECT_FALSE(h.access(f, CONSUMER2).active);
+    auto o = h.request(f, NOV20, EURUSD, CONSUMER);
+    EXPECT_EQ(o.returnCode, FEEDREG_OK);
+    EXPECT_EQ(h.req(o.requestId).requester, CONSUMER);
     h.invariant();
 }
 
-TEST(Access, ProposerShareRoundsDown)
+TEST(Request, RetiredWhilePendingIsStillAnsweredAndPaid)
 {
     H h;
-    uint64 f = h.approved(frankfurter(), 7);
+    uint64 f = h.approved(frankfurter(), 1000);
+    auto o = h.request(f, NOV20, EURUSD);
+    h.pass(FEEDREG_VAR_RETIRE_FEED, (sint64)f);
+    h.endEpoch();
+    ASSERT_EQ(h.status(f), FEEDREG_STATUS_RETIRED);
     sint64 alice = bal(ALICE);
-    h.buy(f, 1);
-    EXPECT_EQ(bal(ALICE), alice + 1);                              // 7 * 2000 / 10000 = 1.4
-    EXPECT_EQ(h.s->dividendPool, 6);
+    h.notify(h.req(o.requestId).oracleQueryId, ORACLE_QUERY_STATUS_SUCCESS, 9);
+    EXPECT_EQ(h.req(o.requestId).status, FEEDREG_REQUEST_ANSWERED);
+    EXPECT_EQ(bal(ALICE), alice + 200);
     h.invariant();
 }
 
-TEST(Access, TableFull)
+TEST(Request, RingOfRecentRequests)
 {
     H h;
-    uint64 f = h.approved(frankfurter(), 1);
-    for (uint64 i = 0; i < FEEDREG_MAX_ACCESS; i++)
+    uint64 f = h.approved(frankfurter());
+    std::vector<sint64> qids;
+    for (uint64 i = 0; i < FEEDREG_MAX_REQUESTS; i++)
     {
-        id u(1000 + i, 9, 9, 9); chain().balances[u] = 10;
-        ASSERT_EQ(h.buy(f, 1, u).returnCode, FEEDREG_OK) << i;
+        ASSERT_EQ(h.request(f, NOV20, EURUSD).returnCode, FEEDREG_OK) << i;
+        qids.push_back(h.lastQueryId());
     }
     sint64 before = bal(CONSUMER);
-    EXPECT_EQ(h.buy(f, 1, CONSUMER).returnCode, FEEDREG_ERR_ACCESS_FULL);
+    EXPECT_EQ(h.request(f, NOV20, EURUSD, CONSUMER, 200).returnCode, FEEDREG_ERR_BUSY);   // 1025 would reuse request 1's slot
     EXPECT_EQ(bal(CONSUMER), before);
-    id first(1000, 9, 9, 9);
-    EXPECT_EQ(h.buy(f, 1, first).returnCode, FEEDREG_OK);         // extending an existing entry still works
+    h.notify(qids[1], ORACLE_QUERY_STATUS_SUCCESS, 1);                                  // request 2 answered: not the slot needed
+    EXPECT_EQ(h.request(f, NOV20, EURUSD, CONSUMER, 200).returnCode, FEEDREG_ERR_BUSY);
+    h.notify(qids[0], ORACLE_QUERY_STATUS_SUCCESS, 1);                                  // request 1 answered
+    auto o = h.request(f, NOV20, EURUSD);
+    EXPECT_EQ(o.returnCode, FEEDREG_OK);
+    EXPECT_EQ(o.requestId, FEEDREG_MAX_REQUESTS + 1);
+    R::GetRequest_input old{1};
+    EXPECT_EQ(h.GetRequest(old).returnCode, FEEDREG_ERR_NOT_FOUND);                    // overwritten
+    R::GetRequest_input still{FEEDREG_MAX_REQUESTS};
+    EXPECT_EQ(h.GetRequest(still).returnCode, FEEDREG_OK);
+    EXPECT_EQ(h.req(FEEDREG_MAX_REQUESTS + 1).status, FEEDREG_REQUEST_PENDING);
+    R::GetRequest_input zero{0}, future{5000};
+    EXPECT_EQ(h.GetRequest(zero).returnCode, FEEDREG_ERR_NOT_FOUND);
+    EXPECT_EQ(h.GetRequest(future).returnCode, FEEDREG_ERR_NOT_FOUND);
     h.invariant();
-    h.endEpoch();
-    EXPECT_EQ(h.buy(f, 1, CONSUMER).returnCode, FEEDREG_OK);       // room again after the sweep
+}
+
+// ---- parameters, checked against the feed's kinds
+
+static uint32 paramResult(uint8 kind, const std::string& value)
+{
+    H h;
+    R::FeedDefinition d = withUrl("https://example.com/{0}", 1);
+    d.paramKinds.set(0, kind);
+    uint64 f = h.approved(d);
+    return h.request(f, NOV20, {value}).returnCode;
+}
+
+TEST(Params, IsoDate)
+{
+    for (auto v : {"2026-11-20", "2024-02-29", "0001-01-01", "2026-12-31"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_ISO_DATE, v), FEEDREG_OK) << v;
+    for (auto v : {"2023-02-29", "2026-13-01", "2026-00-10", "2026-04-31", "2026-1-01", "2026/01/01", "2026-01-011", "20260101", "2026-0a-01", "2026-0:-01", "20:6-01-01", "2026-01-0:", ""})
+        EXPECT_EQ(paramResult(FEEDREG_PARAM_ISO_DATE, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, Currency)
+{
+    EXPECT_EQ(paramResult(FEEDREG_PARAM_CURRENCY, "USD"), FEEDREG_OK);
+    for (auto v : {"usd", "US", "USDT", "U$D", "1SD"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_CURRENCY, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, Integer)
+{
+    for (auto v : {"0", "-12", "123456789012345678", "-123456789012345678"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_INTEGER, v), FEEDREG_OK) << v;
+    for (auto v : {"1.5", "-", "1234567890123456789", "+1", "1a", "1-", "--1"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_INTEGER, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, Decimal)
+{
+    for (auto v : {"1.5", "-0.25", "12", "0.123456789012345678"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_DECIMAL, v), FEEDREG_OK) << v;
+    for (auto v : {"1.", ".5", "1.2.3", "0.1234567890123456789", "-.5", "1e5"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_DECIMAL, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, Slug)
+{
+    for (std::string v : {std::string("abc-1"), std::string("a"), std::string("0"), std::string(32, 'z')}) EXPECT_EQ(paramResult(FEEDREG_PARAM_SLUG, v), FEEDREG_OK) << v;
+    for (auto v : {"ABC", "a_b", "a b", "a.b", ""}) EXPECT_EQ(paramResult(FEEDREG_PARAM_SLUG, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, Coordinate)
+{
+    for (auto v : {"180", "-180.0000", "53.3811", "-1.4701", "0"}) EXPECT_EQ(paramResult(FEEDREG_PARAM_COORDINATE, v), FEEDREG_OK) << v;
+    for (auto v : {"180.0001", "181", "12.34567", "1234", "0045", "-", "5."}) EXPECT_EQ(paramResult(FEEDREG_PARAM_COORDINATE, v), FEEDREG_ERR_PARAMS) << v;
+}
+
+TEST(Params, PaddingAndUnusedSlots)
+{
+    H h;
+    uint64 f = h.approved(frankfurter());
+    EXPECT_EQ(h.request(f, NOV20, {"2026-11-20", "EUR", "USD", "X"}).returnCode, FEEDREG_ERR_PARAMS);   // 4th not declared
+    EXPECT_EQ(h.request(f, NOV20, {"2026-11-20", "EUR"}).returnCode, FEEDREG_ERR_PARAMS);             // 3rd missing
+    EXPECT_EQ(h.request(f, NOV20, {"2026-11-20", std::string("EUR\0X", 5), "USD"}).returnCode, FEEDREG_ERR_PARAMS);  // bytes after the end
+    R::RequestValue_input in; memset((void*)&in, 0, sizeof(in));
+    in.feedId = f; in.timestamp = NOV20;
+    for (int j = 0; j < 3; j++) for (int i = 0; i < (int)EURUSD[j].size(); i++) in.params.set(j * 32 + i, EURUSD[j][i]);
+    in.params.set(127, 1);                                                                          // last byte of slot 4
+    EXPECT_EQ(h.RequestValue(in, CONSUMER, 200).returnCode, FEEDREG_ERR_PARAMS);
+    in.params.set(127, 0);
+    EXPECT_EQ(h.RequestValue(in, CONSUMER, 200).returnCode, FEEDREG_OK);
     h.invariant();
 }
 
@@ -764,7 +953,7 @@ TEST(List, PagesAndFilters)
     EXPECT_EQ(p1.count, FEEDREG_LIST_PAGE);
     EXPECT_EQ(p1.nextFeedId, 17u);
     EXPECT_EQ(p1.feeds.get(0).feedId, 1u);
-    EXPECT_EQ(p1.feeds.get(3).feePerEpoch, 3);
+    EXPECT_EQ(p1.feeds.get(3).feePerUse, 3);
     in.startFeedId = p1.nextFeedId;
     auto p2 = h.ListFeeds(in);
     EXPECT_EQ(p2.count, 4u);
@@ -788,7 +977,7 @@ TEST(List, SummaryFields)
     auto s = h.ListFeeds(in).feeds.get(0);
     EXPECT_EQ(s.restricted, 1);
     EXPECT_EQ(s.timePolicy, FEEDREG_TIME_HISTORICAL);
-    EXPECT_EQ(s.valueType, FEEDREG_VALUE_DECIMAL);
+    EXPECT_EQ(s.valueType, OI::HttpRead::ValueType::decimal);
     EXPECT_EQ(s.decimals, 6);
 }
 
@@ -799,19 +988,30 @@ TEST(Scenario, MoneyIsAlwaysAccountedFor)
     H h;
     uint64 seed = 12345;
     auto rnd = [&](uint64 n) { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return (seed >> 33) % n; };
+    std::vector<sint64> open;
     for (int step = 0; step < 3000; step++)
     {
-        switch (rnd(6))
+        switch (rnd(7))
         {
-        case 0: h.propose(withUrl("https://example.com/s" + std::to_string(rnd(40))), rnd(2) ? ALICE : BOB, (sint64)rnd(3) * 100, NULL_ID, FEEDREG_DEFAULT_DEPOSIT + (sint64)rnd(3)); break;
+        case 0: h.propose(withUrl("https://example.com/s" + std::to_string(rnd(40))), rnd(2) ? ALICE : BOB, (sint64)rnd(3) * 1000, rnd(5) ? NULL_ID : CONSUMER, FEEDREG_DEFAULT_DEPOSIT + (sint64)rnd(3)); break;
         case 1: { R::WithdrawFeed_input in{rnd(h.s->feedCount + 2)}; h.WithdrawFeed(in, rnd(2) ? ALICE : BOB); break; }
-        case 2: if (h.s->feedCount) { uint64 f = 1 + rnd(h.s->feedCount); uint16 i = h.openVote(rnd(2) ? FEEDREG_VAR_APPROVE_FEED : FEEDREG_VAR_RETIRE_FEED, (sint64)f); if (i != INVALID_PROPOSAL_INDEX) { h.vote(SH1, i, 1); h.vote(SH2, i, 1); } } break;
-        case 3: if (h.s->feedCount) h.buy(1 + rnd(h.s->feedCount), (uint16)rnd(5), rnd(2) ? CONSUMER : CONSUMER2, (sint64)rnd(1000)); break;
-        case 4: if (rnd(10) == 0) h.endEpoch(); break;
+        case 2: if (h.s->feedCount)
+            {
+                uint64 f = 1 + rnd(h.s->feedCount);
+                for (uint64 k = 0; k < h.s->feedCount && h.s->feeds.get(f - 1).status != FEEDREG_STATUS_PENDING; k++) f = f % h.s->feedCount + 1;
+                uint16 i = h.openVote(rnd(4) ? FEEDREG_VAR_APPROVE_FEED : FEEDREG_VAR_RETIRE_FEED, (sint64)(rnd(4) ? f : 1 + rnd(h.s->feedCount)), rnd(2) ? SH1 : SH2);
+                if (i != INVALID_PROPOSAL_INDEX) { h.vote(SH1, i, 1); h.vote(SH2, i, 1); }
+            }
+            break;
+        case 3: if (h.s->feedCount) { auto o = h.request(1 + rnd(h.s->feedCount), NOV20, {}, rnd(2) ? CONSUMER : CONSUMER2, 150 + (sint64)rnd(2500)); if (o.returnCode == FEEDREG_OK) open.push_back(h.lastQueryId()); } break;
+        case 4: if (!open.empty()) { size_t k = rnd(open.size()); static const uint8 st[] = {ORACLE_QUERY_STATUS_SUCCESS, ORACLE_QUERY_STATUS_TIMEOUT, ORACLE_QUERY_STATUS_UNRESOLVABLE}; h.notify(open[k], st[rnd(3)], 5); open.erase(open.begin() + k); } break;
+        case 5: if (rnd(3) == 0) h.endEpoch(); break;
         default: break;
         }
         h.invariant();
         if (::testing::Test::HasFailure()) { ADD_FAILURE() << "step " << step; return; }
     }
     EXPECT_GT(h.s->feedCount, 10u);
+    EXPECT_GT(h.s->nextRequestId, 50u);
+    EXPECT_GT(chain().dividends, 0);
 }

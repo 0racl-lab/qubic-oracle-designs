@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <map>
 #include <vector>
+#include <type_traits>
 
 typedef bool bit;
 typedef uint8_t uint8; typedef int8_t sint8;
@@ -15,11 +16,25 @@ typedef uint16_t uint16; typedef int16_t sint16;
 typedef uint32_t uint32; typedef int32_t sint32;
 typedef unsigned long long uint64; typedef long long sint64;
 
+namespace QPI { namespace Ch {
+    enum : char
+    {
+        null = 0, underscore = '_', minus = '-', dot = '.',
+        a = 'a', b = 'b', c = 'c', d = 'd', e = 'e', f = 'f', g = 'g', h = 'h', i = 'i', j = 'j', k = 'k', l = 'l', m = 'm',
+        n = 'n', o = 'o', p = 'p', q = 'q', r = 'r', s = 's', t = 't', u = 'u', v = 'v', w = 'w', x = 'x', y = 'y', z = 'z',
+        _0 = '0', _1 = '1', _2 = '2', _3 = '3', _4 = '4', _5 = '5', _6 = '6', _7 = '7', _8 = '8', _9 = '9',
+    };
+} }
+typedef decltype(QPI::Ch::a) MockChType;
+
 struct id
 {
     struct { uint64 _0, _1, _2, _3; } u64;
     id() { u64 = {0, 0, 0, 0}; }
     id(uint64 a, uint64 b, uint64 c, uint64 d) { u64 = {a, b, c, d}; }
+    // id(Ch::f, Ch::e, ...) as in core: characters packed from the first byte
+    template <typename... T, typename = std::enable_if_t<(std::is_same_v<T, MockChType> && ...)>>
+    id(T... cs) { u64 = {0, 0, 0, 0}; char v[] = {cs...}; memcpy(&u64, v, sizeof(v) < 32 ? sizeof(v) : 32); }
     bool operator==(const id& o) const { return !memcmp(&u64, &o.u64, 32); }
     bool operator!=(const id& o) const { return !(*this == o); }
     bool operator<(const id& o) const { return memcmp(&u64, &o.u64, 32) < 0; }
@@ -116,7 +131,59 @@ namespace QPI
 }
 using namespace QPI;
 
-namespace QPI { struct DateAndTime { uint64 value; }; }
+namespace QPI
+{
+    // Same interface as core's DateAndTime for what FeedRegistry uses; stored as microseconds
+    // since 0000-03-01 plus one (0 = invalid), so comparisons are plain integer comparisons.
+    struct DateAndTime
+    {
+        uint64 value;
+        DateAndTime() : value(0) {}
+        DateAndTime(uint64 y, uint64 mo, uint64 d, uint64 h = 0, uint64 mi = 0, uint64 s = 0) : value(0)
+        {
+            if (isValid(y, mo, d, h, mi, s, 0, 0)) value = ((((days(y, mo, d) * 24 + h) * 60 + mi) * 60 + s) * 1000000ULL) + 1;
+        }
+        static bool isLeapYear(uint64 y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+        static bool isValid(uint64 y, uint64 mo, uint64 d, uint64 h, uint64 mi, uint64 s, uint64 ms, uint64 us)
+        {
+            static const uint8 dim[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            if (y > 0xffff || mo < 1 || mo > 12 || d < 1) return false;
+            if (d > (uint64)(dim[mo] + (mo == 2 && isLeapYear(y) ? 1 : 0))) return false;
+            return h < 24 && mi < 60 && s < 60 && ms < 1000 && us < 1000;
+        }
+        bool isValid() const { return value != 0; }
+        bool setIfValid(uint64 y, uint64 mo, uint64 d, uint64 h, uint64 mi, uint64 s, uint64 ms = 0, uint64 us = 0)
+        {
+            if (!isValid(y, mo, d, h, mi, s, ms, us)) return false;
+            *this = DateAndTime(y, mo, d, h, mi, s); return true;
+        }
+        static uint64 days(uint64 y, uint64 m, uint64 d)   // days since 0000-03-01
+        {
+            if (m <= 2) { y -= 1; m += 12; }
+            return 365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + d - 1;
+        }
+        bool add(sint64 years, sint64 months, sint64 dd, sint64 hh, sint64 mm, sint64 ss, sint64 ms = 0, sint64 us = 0)
+        {
+            if (!value || years || months) return false;
+            sint64 delta = ((((dd * 24 + hh) * 60 + mm) * 60 + ss) * 1000 + ms) * 1000 + us;
+            if (delta < 0 && (uint64)(-delta) >= value) return false;
+            value = (uint64)((sint64)value + delta); return true;
+        }
+        bool operator<(const DateAndTime& o) const { return value < o.value; }
+        bool operator>(const DateAndTime& o) const { return value > o.value; }
+        bool operator<=(const DateAndTime& o) const { return value <= o.value; }
+        bool operator>=(const DateAndTime& o) const { return value >= o.value; }
+        bool operator==(const DateAndTime& o) const { return value == o.value; }
+        bool operator!=(const DateAndTime& o) const { return value != o.value; }
+    };
+}
+using QPI::DateAndTime;
+namespace OI
+{
+#define ORACLE_INTERFACE_INDEX 8
+#include "../../oracle_interfaces/HttpRead.h"
+#undef ORACLE_INTERFACE_INDEX
+}
 // ---------------------------------------------------------------- shareholder proposals (types as in core qpi_proposals.h)
 namespace QPI
 {
@@ -211,6 +278,13 @@ struct MockChain
     uint32 tick = 1000; uint16 epoch = 250;
     sint64 burned = 0, dividends = 0;
     std::map<id, sint64> shares;      // registry shares possessed (voting rights)
+    // ---- simulated HttpRead oracle
+    struct MockQuery { sint64 queryId; OI::HttpRead::OracleQuery query; uint32 timeoutMs; };
+    std::vector<MockQuery> queries;
+    sint64 nextQueryId = 5000;
+    sint64 oracleFeesPaid = 0;
+    bool oracleRejects = false;
+    DateAndTime now = DateAndTime(2026, 11, 24, 12, 0, 0);
 };
 inline MockChain& chain() { static MockChain c; return c; }
 
@@ -339,6 +413,17 @@ struct QpiCtx
     bool getEntity(const id& who, Entity& e) const { memset(&e, 0, sizeof(e)); e.publicKey = who; e.incomingAmount = chain().balances[who]; return true; }
     uint32 tick() const { return chain().tick; }
     uint16 epoch() const { return chain().epoch; }
+    DateAndTime now() const { return chain().now; }
+    sint64 queryOracle(const OI::HttpRead::OracleQuery& q, uint32 timeoutMs) const
+    {
+        sint64 fee = OI::HttpRead::getQueryFee(q);
+        auto& b = chain().balances;
+        if (chain().oracleRejects || b[MOCK_CONTRACT_ID] < fee) return -1;
+        b[MOCK_CONTRACT_ID] -= fee; chain().oracleFeesPaid += fee;
+        sint64 qid = chain().nextQueryId++;
+        chain().queries.push_back({qid, q, timeoutMs});
+        return qid;
+    }
     template <typename T> T& operator()(T& x) const { return x; }
     template <typename T> const T& operator()(const T& x) const { return x; }
 };

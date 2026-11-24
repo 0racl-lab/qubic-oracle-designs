@@ -1,7 +1,7 @@
 // Syntax and type check of FeedRegistry.h against the real QPI headers of qubic/core.
 // Core's contract build needs MSVC; this checks only what a Linux compiler can see:
 // every QPI call, type and macro the contract uses exists with a matching signature,
-// and the sizes below. Proposal-voting internals are stubbed (their real definition
+// and the sizes below. Proposal-voting internals are stubbed, HttpRead comes from oracle_interfaces/ (their real definition
 // pulls in the UEFI platform layer).
 #define NO_UEFI
 #include "contract_core/pre_qpi_def.h"
@@ -16,6 +16,13 @@ namespace QPI
     };
     template <typename ProposalDataType, uint32 numOfVoters>
     struct ProposalWithAllVoteData { ProposalDataType proposalData; };
+}
+// HttpRead is a draft in this repo, not yet in core: register it the way oracle_interfaces_def.h would
+namespace OI
+{
+#define ORACLE_INTERFACE_INDEX 8
+#include "HttpRead.h"
+#undef ORACLE_INTERFACE_INDEX
 }
 #define CONTRACT_INDEX 63
 #define CONTRACT_STATE_TYPE FEEDREG
