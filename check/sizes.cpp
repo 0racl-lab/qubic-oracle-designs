@@ -21,6 +21,9 @@ namespace OI
 #define ORACLE_INTERFACE_INDEX 8
 #include "ProofVerify.h"
 #undef ORACLE_INTERFACE_INDEX
+#define ORACLE_INTERFACE_INDEX 9
+#include "HttpRead.h"
+#undef ORACLE_INTERFACE_INDEX
 }
 
 #include <cstddef>
@@ -29,7 +32,7 @@ namespace OI
 #define FITS(I) \
     static_assert(sizeof(OI::I::OracleQuery) <= MAX_ORACLE_QUERY_SIZE, #I " query too large"); \
     static_assert(sizeof(OI::I::OracleReply) <= MAX_ORACLE_REPLY_SIZE, #I " reply too large")
-FITS(ContentRead); FITS(UtxoTxRead); FITS(EvmCallRead); FITS(ProofVerify);
+FITS(ContentRead); FITS(UtxoTxRead); FITS(EvmCallRead); FITS(ProofVerify); FITS(HttpRead);
 
 // exact sizes and offsets documented in the headers (no hidden padding)
 static_assert(sizeof(OI::ContentRead::OracleQuery) == 208 && sizeof(OI::ContentRead::OracleReply) == 536);
@@ -41,6 +44,10 @@ static_assert(sizeof(OI::EvmCallRead::OracleQuery) == 568 && sizeof(OI::EvmCallR
 static_assert(offsetof(OI::EvmCallRead::OracleQuery, calldata) == 56 && offsetof(OI::EvmCallRead::OracleReply, data) == 56);
 static_assert(sizeof(OI::ProofVerify::OracleQuery) == 808 && sizeof(OI::ProofVerify::OracleReply) == 112);
 static_assert(offsetof(OI::ProofVerify::OracleQuery, proof) == 384 && offsetof(OI::ProofVerify::OracleQuery, proofSha256) == 640);
+static_assert(sizeof(OI::HttpRead::OracleQuery) == 256 && sizeof(OI::HttpRead::OracleReply) == 160);
+static_assert(offsetof(OI::HttpRead::OracleQuery, timestamp) == 40 && offsetof(OI::HttpRead::OracleQuery, params) == 48);
+static_assert(offsetof(OI::HttpRead::OracleQuery, field) == 176 && offsetof(OI::HttpRead::OracleQuery, decimals) == 248);
+static_assert(offsetof(OI::HttpRead::OracleReply, intValue) == 16 && offsetof(OI::HttpRead::OracleReply, text) == 32);
 static_assert(offsetof(OI::ProofVerify::OracleQuery, context) == 744 && offsetof(OI::ProofVerify::OracleReply, context) == 48);
 
 int main()
@@ -54,6 +61,7 @@ int main()
     printf("UtxoTxRead   query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::UtxoTxRead::OracleQuery), sizeof(OI::UtxoTxRead::OracleReply), (long long)OI::UtxoTxRead::getQueryFee({}));
     printf("EvmCallRead  query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::EvmCallRead::OracleQuery), sizeof(OI::EvmCallRead::OracleReply), (long long)OI::EvmCallRead::getQueryFee({}));
     printf("ProofVerify  query %4zu  reply %4zu  fee %lld/%lld QU (by hash/inline)\n", sizeof(OI::ProofVerify::OracleQuery), sizeof(OI::ProofVerify::OracleReply), (long long)f3, (long long)f4);
+    printf("HttpRead     query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::HttpRead::OracleQuery), sizeof(OI::HttpRead::OracleReply), (long long)OI::HttpRead::getQueryFee({}));
     printf("limits: query <= %d, reply <= %d bytes\n", (int)MAX_ORACLE_QUERY_SIZE, (int)MAX_ORACLE_REPLY_SIZE);
     return (f1 >= 10 && f2 >= f1 && f3 >= 10 && f4 >= 10) ? 0 : 1;
 }

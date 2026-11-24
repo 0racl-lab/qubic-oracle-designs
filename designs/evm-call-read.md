@@ -1,8 +1,8 @@
 # EvmCallRead: read EVM contract state at a finalized block
 
 > **Status:** implemented as patches for both repositories, tested, not yet reviewed by the core or oracle team.
-> - qubic/core: [`patches/qubic-core.patch`](../patches/qubic-core.patch), with the interface header [`oracle_interfaces/EvmCallRead.h`](../oracle_interfaces/EvmCallRead.h) at index 5
-> - qubic/oracle-machine: [`patches/oracle-machine.patch`](../patches/oracle-machine.patch), service `oracles/read_evm_call`
+> - qubic/core: [`patches/qubic-core/`](../patches/qubic-core), with the interface header [`oracle_interfaces/EvmCallRead.h`](../oracle_interfaces/EvmCallRead.h) at index 5
+> - qubic/oracle-machine: [`patches/oracle-machine/`](../patches/oracle-machine), service `oracles/read_evm_call`
 
 **In one line:** a contract asks for a read-only call to an EVM contract at a specific finalized block (for example `balanceOf(x)` on Base at block N), and the oracle returns the raw result.
 

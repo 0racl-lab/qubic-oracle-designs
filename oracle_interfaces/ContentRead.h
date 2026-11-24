@@ -3,8 +3,6 @@ using namespace QPI;
 /**
 * Oracle interface "ContentRead" (see Price.h for general documentation about oracle interfaces).
 *
-* DESIGN SKETCH - not part of qubic/core. See designs/content-read.md.
-*
 * Read a file named by its content hash. The query gives the SHA-256 of the whole file and a
 * locator (an IPFS CID, an Arweave transaction id, or nothing). The oracle machine fetches the file
 * from the locator or from known mirrors, checks that SHA-256 of the full bytes equals the query's
@@ -14,7 +12,10 @@ using namespace QPI;
 * oracle machine that finds the file holds exactly the same bytes and gives the same reply. The only
 * thing that can differ between machines is whether the file was found in time; that shows up as
 * RESULT_NOT_FOUND, which contracts must treat as "not available right now", never as "does not
-* exist". On failure all reply fields except code MUST be zero.
+* exist". A file larger than maxFileSize can't be verified (it is never downloaded in full), so it
+* is also RESULT_NOT_FOUND. On failure all reply fields except code MUST be zero.
+*
+* Served by oracle-machine oracles/read_content (208-byte query, 536-byte reply).
 */
 struct ContentRead
 {
@@ -44,14 +45,13 @@ struct ContentRead
 
     //--- Result codes returned in OracleReply.code. 0 means success; any non-zero value is a failure
     //    reason and implies all other reply fields are all-zero.
-    static constexpr uint64 RESULT_SUCCESS     = 0;  ///< file found and verified; reply fields valid
-    static constexpr uint64 RESULT_BAD_QUERY   = 1;  ///< malformed query (zero hash, unknown mode or locator kind, ...)
-    static constexpr uint64 RESULT_NOT_FOUND   = 2;  ///< no source delivered bytes matching the hash in time (retriable)
-    static constexpr uint64 RESULT_TOO_LARGE   = 3;  ///< the matching file is larger than maxFileSize
-    static constexpr uint64 RESULT_BAD_RANGE   = 4;  ///< offset/length outside the file, or length > MAX_DATA
-    static constexpr uint64 RESULT_NOT_JSON    = 5;  ///< mode jsonField but the file is not valid UTF-8 JSON
-    static constexpr uint64 RESULT_NO_FIELD    = 6;  ///< mode jsonField but the path does not exist
-    static constexpr uint64 RESULT_VALUE_TOO_LARGE = 7; ///< the JSON value's canonical form exceeds MAX_DATA bytes
+    static constexpr uint64 RESULT_SUCCESS         = 0;  ///< file found and verified; reply fields valid
+    static constexpr uint64 RESULT_BAD_QUERY       = 1;  ///< malformed query (zero hash, bad locator, unknown mode, dirty padding, ...)
+    static constexpr uint64 RESULT_NOT_FOUND       = 2;  ///< no source delivered bytes matching the hash within maxFileSize (retriable)
+    static constexpr uint64 RESULT_BAD_RANGE       = 3;  ///< offset/length outside the file, or length outside 1..MAX_DATA
+    static constexpr uint64 RESULT_NOT_JSON        = 4;  ///< mode jsonField but the file is not valid UTF-8 I-JSON (RFC 7493)
+    static constexpr uint64 RESULT_NO_FIELD        = 5;  ///< mode jsonField but the path does not exist
+    static constexpr uint64 RESULT_VALUE_TOO_LARGE = 6;  ///< the JSON value's canonical form exceeds MAX_DATA bytes
     // add new result codes above this line
     //
     // RESULT_NOT_FOUND is a time-varying observation: retry later, never punish anyone for it.
@@ -72,10 +72,11 @@ struct ContentRead
         /// One of LocatorKind.
         uint64 locatorKind;          // [32..40)
 
-        /// Number of valid bytes in locator (0..64).
+        /// Number of valid bytes in locator (0 for LocatorKind::none, else 1..64).
         uint64 locatorLen;           // [40..48)
 
-        /// ASCII locator (IPFS CID or Arweave id), zero-padded.
+        /// ASCII locator (IPFS CID: base32/base58 alphanumerics; Arweave id: 43 base64url chars),
+        /// zero-padded.
         Array<uint8, 64> locator;    // [48..112)
 
         /// Refuse files larger than this (1..MAX_FILE_SIZE). Also sets the fee.
@@ -90,7 +91,8 @@ struct ContentRead
         /// Mode byteRange: number of bytes to return (1..MAX_DATA).
         uint64 length;               // [136..144)
 
-        /// Mode jsonField: dot path such as "meta.licence" or "items.3.name", ASCII, zero-padded.
+        /// Mode jsonField: dot path such as "meta.licence" or "items.3.name" (a numeric segment
+        /// indexes an array), printable ASCII without '.' inside keys, zero-padded. Empty = the root.
         Array<uint8, 64> jsonPath;   // [144..208)
     };
 

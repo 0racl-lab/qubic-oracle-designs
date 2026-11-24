@@ -1,5 +1,5 @@
 #define NO_UEFI
-// Linux build of the EvmCallRead / UtxoTxRead tests from test/oracle_engine.cpp (core's full test
+// Linux build of the EvmCallRead / UtxoTxRead / ContentRead tests from test/oracle_engine.cpp (core's full test
 // suite builds with MSVC only). Only the interface registry and QPI are needed for these tests.
 #include "gtest/gtest.h"
 #include "contract_core/pre_qpi_def.h"

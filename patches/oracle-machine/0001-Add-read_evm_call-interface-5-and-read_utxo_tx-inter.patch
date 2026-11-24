@@ -1,8 +1,8 @@
-From bae2918118b281200be06e0850ed1cbadf17eb0d Mon Sep 17 00:00:00 2001
-From: Oracl <oracl@users.noreply.github.com>
-Date: Tue, 24 Nov 2026 16:09:24 +0000
-Subject: [PATCH] Add read_evm_call (interface 5) and read_utxo_tx (interface
- 6) services
+From 1aa2c5ab39ff9fb859070308a0e94fb402583f97 Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:41:59 +0000
+Subject: [PATCH 1/2] Add read_evm_call (interface 5) and read_utxo_tx
+ (interface 6) services
 
 read_evm_call: eth_call at a finalized block, pinned with EIP-1898, fixed
 sender and gas, multi-provider byte agreement; reuses EVM_RPC_URLS_<chainId>.

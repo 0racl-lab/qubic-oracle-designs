@@ -1,0 +1,360 @@
+From bf9495f34c8ded1015986960ab58a6acf99770c5 Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:41:59 +0000
+Subject: [PATCH 2/2] Add oracle interface ContentRead (7)
+
+Read a file named by the SHA-256 of its bytes: its size, a byte range (up to
+512 bytes) or one JSON field in RFC 8785 canonical form. The locator (IPFS CID
+or Arweave id) is only a hint; the hash decides. Fee 50 QU + 10 QU per started
+MiB of maxFileSize (max 64 MiB). Registered at index 7; 4 tests added to
+test/oracle_engine.cpp. Reference service: oracle-machine oracles/read_content.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ src/Qubic.vcxproj                       |   1 +
+ src/Qubic.vcxproj.filters               |   3 +
+ src/oracle_core/oracle_interfaces_def.h |   6 ++
+ src/oracle_interfaces/ContentRead.h     | 138 ++++++++++++++++++++++++
+ test/oracle_engine.cpp                  | 119 +++++++++++++++++++-
+ 5 files changed, 264 insertions(+), 3 deletions(-)
+ create mode 100644 src/oracle_interfaces/ContentRead.h
+
+diff --git a/src/Qubic.vcxproj b/src/Qubic.vcxproj
+index 76e9f72..c3d242b 100644
+--- a/src/Qubic.vcxproj
++++ b/src/Qubic.vcxproj
+@@ -125,6 +125,7 @@
+     <ClInclude Include="oracle_interfaces\QubicLogRead.h" />
+     <ClInclude Include="oracle_interfaces\EvmCallRead.h" />
+     <ClInclude Include="oracle_interfaces\UtxoTxRead.h" />
++    <ClInclude Include="oracle_interfaces\ContentRead.h" />
+     <ClInclude Include="platform\assert.h" />
+     <ClInclude Include="platform\concurrency.h" />
+     <ClInclude Include="four_q.h" />
+diff --git a/src/Qubic.vcxproj.filters b/src/Qubic.vcxproj.filters
+index 64e66b4..b4d803d 100644
+--- a/src/Qubic.vcxproj.filters
++++ b/src/Qubic.vcxproj.filters
+@@ -475,6 +475,9 @@
+     <ClInclude Include="oracle_interfaces\UtxoTxRead.h">
+       <Filter>oracle_interfaces</Filter>
+     </ClInclude>
++    <ClInclude Include="oracle_interfaces\ContentRead.h">
++      <Filter>oracle_interfaces</Filter>
++    </ClInclude>
+     <ClInclude Include="optimizations\opt_parallel_sign_votes.h">
+       <Filter>optimizations</Filter>
+     </ClInclude>
+diff --git a/src/oracle_core/oracle_interfaces_def.h b/src/oracle_core/oracle_interfaces_def.h
+index d386b21..9e460d4 100644
+--- a/src/oracle_core/oracle_interfaces_def.h
++++ b/src/oracle_core/oracle_interfaces_def.h
+@@ -33,6 +33,10 @@ namespace OI
+ #include "oracle_interfaces/UtxoTxRead.h"
+ #undef ORACLE_INTERFACE_INDEX
+ 
++#define ORACLE_INTERFACE_INDEX 7
++#include "oracle_interfaces/ContentRead.h"
++#undef ORACLE_INTERFACE_INDEX
++
+ // add new interface above this line (define ORACLE_INTERFACE_INDEX, include the header file and undef ORACLE_INTERFACE_INDEX)
+ 
+ #define DEFINE_ORACLE_INTERFACE(Interface) {sizeof(Interface::OracleQuery), sizeof(Interface::OracleReply)}
+@@ -48,6 +52,7 @@ namespace OI
+ 		DEFINE_ORACLE_INTERFACE(QubicLogRead),
+ 		DEFINE_ORACLE_INTERFACE(EvmCallRead),
+ 		DEFINE_ORACLE_INTERFACE(UtxoTxRead),
++		DEFINE_ORACLE_INTERFACE(ContentRead),
+ 		// add new interface above this line (with DEFINE_ORACLE_INTERFACE; the order must match the interfaces indices)
+ 	};
+ 
+@@ -82,6 +87,7 @@ namespace OI
+ 		REGISTER_ORACLE_INTERFACE(QubicLogRead);
+ 		REGISTER_ORACLE_INTERFACE(EvmCallRead);
+ 		REGISTER_ORACLE_INTERFACE(UtxoTxRead);
++		REGISTER_ORACLE_INTERFACE(ContentRead);
+ 		// add new interface above this line (with REGISTER_ORACLE_INTERFACE)
+ 
+ 		for (uint32_t idx = 0; idx < oracleInterfacesCount; ++idx)
+diff --git a/src/oracle_interfaces/ContentRead.h b/src/oracle_interfaces/ContentRead.h
+new file mode 100644
+index 0000000..aeb449b
+--- /dev/null
++++ b/src/oracle_interfaces/ContentRead.h
+@@ -0,0 +1,138 @@
++using namespace QPI;
++
++/**
++* Oracle interface "ContentRead" (see Price.h for general documentation about oracle interfaces).
++*
++* Read a file named by its content hash. The query gives the SHA-256 of the whole file and a
++* locator (an IPFS CID, an Arweave transaction id, or nothing). The oracle machine fetches the file
++* from the locator or from known mirrors, checks that SHA-256 of the full bytes equals the query's
++* hash, and returns the part the contract asked for: the file size, a byte range, or one JSON field.
++*
++* Determinism (see Price.h): the hash is the truth. Bytes that don't match it are discarded, so every
++* oracle machine that finds the file holds exactly the same bytes and gives the same reply. The only
++* thing that can differ between machines is whether the file was found in time; that shows up as
++* RESULT_NOT_FOUND, which contracts must treat as "not available right now", never as "does not
++* exist". A file larger than maxFileSize can't be verified (it is never downloaded in full), so it
++* is also RESULT_NOT_FOUND. On failure all reply fields except code MUST be zero.
++*
++* Served by oracle-machine oracles/read_content (208-byte query, 536-byte reply).
++*/
++struct ContentRead
++{
++    //-------------------------------------------------------------------------
++    // Mandatory oracle interface definitions
++
++    /// Oracle interface index
++    static constexpr uint32 oracleInterfaceIndex = ORACLE_INTERFACE_INDEX;
++
++    //--- Where to look (a hint only: the hash decides what is accepted)
++    struct LocatorKind
++    {
++        static constexpr uint64 none    = 0;    ///< no locator: try the oracle machines' known mirrors only
++        static constexpr uint64 ipfsCid = 1;    ///< locator holds an IPFS CID (v0 or v1) as ASCII
++        static constexpr uint64 arweave = 2;    ///< locator holds an Arweave transaction id (43 chars, base64url)
++        // add new locator kinds above this line
++    };
++
++    //--- What to return
++    struct Mode
++    {
++        static constexpr uint64 size      = 1;  ///< only fileSize: proves the file is available now
++        static constexpr uint64 byteRange = 2;  ///< `length` bytes from `offset`
++        static constexpr uint64 jsonField = 3;  ///< parse the file as JSON and return one value (RFC 8785 canonical form)
++        // add new modes above this line
++    };
++
++    //--- Result codes returned in OracleReply.code. 0 means success; any non-zero value is a failure
++    //    reason and implies all other reply fields are all-zero.
++    static constexpr uint64 RESULT_SUCCESS         = 0;  ///< file found and verified; reply fields valid
++    static constexpr uint64 RESULT_BAD_QUERY       = 1;  ///< malformed query (zero hash, bad locator, unknown mode, dirty padding, ...)
++    static constexpr uint64 RESULT_NOT_FOUND       = 2;  ///< no source delivered bytes matching the hash within maxFileSize (retriable)
++    static constexpr uint64 RESULT_BAD_RANGE       = 3;  ///< offset/length outside the file, or length outside 1..MAX_DATA
++    static constexpr uint64 RESULT_NOT_JSON        = 4;  ///< mode jsonField but the file is not valid UTF-8 I-JSON (RFC 7493)
++    static constexpr uint64 RESULT_NO_FIELD        = 5;  ///< mode jsonField but the path does not exist
++    static constexpr uint64 RESULT_VALUE_TOO_LARGE = 6;  ///< the JSON value's canonical form exceeds MAX_DATA bytes
++    // add new result codes above this line
++    //
++    // RESULT_NOT_FOUND is a time-varying observation: retry later, never punish anyone for it.
++    // All other codes are properties of the verified bytes and are the same for every machine.
++
++    /// Largest file an oracle machine will fetch (64 MiB).
++    static constexpr uint64 MAX_FILE_SIZE = 67108864ULL;
++
++    /// Bytes returned per reply (QPI arrays must have a power-of-two capacity).
++    static constexpr uint64 MAX_DATA = 512;
++
++    /// Oracle query data / input to the oracle machine. Fixed 208 bytes.
++    struct OracleQuery
++    {
++        /// SHA-256 of the complete file. This is the truth; the locator is only a hint.
++        Array<uint8, 32> sha256;     // [0..32)
++
++        /// One of LocatorKind.
++        uint64 locatorKind;          // [32..40)
++
++        /// Number of valid bytes in locator (0 for LocatorKind::none, else 1..64).
++        uint64 locatorLen;           // [40..48)
++
++        /// ASCII locator (IPFS CID: base32/base58 alphanumerics; Arweave id: 43 base64url chars),
++        /// zero-padded.
++        Array<uint8, 64> locator;    // [48..112)
++
++        /// Refuse files larger than this (1..MAX_FILE_SIZE). Also sets the fee.
++        uint64 maxFileSize;          // [112..120)
++
++        /// One of Mode.
++        uint64 mode;                 // [120..128)
++
++        /// Mode byteRange: first byte to return.
++        uint64 offset;               // [128..136)
++
++        /// Mode byteRange: number of bytes to return (1..MAX_DATA).
++        uint64 length;               // [136..144)
++
++        /// Mode jsonField: dot path such as "meta.licence" or "items.3.name" (a numeric segment
++        /// indexes an array), printable ASCII without '.' inside keys, zero-padded. Empty = the root.
++        Array<uint8, 64> jsonPath;   // [144..208)
++    };
++
++    /// Oracle reply data / output of the oracle machine. Fixed 536 bytes.
++    /// On failure (code != RESULT_SUCCESS) all other fields MUST be all-zero.
++    struct OracleReply
++    {
++        /// One of the RESULT_* codes above.
++        uint64 code;                 // [0..8)
++
++        /// Size of the whole verified file in bytes.
++        uint64 fileSize;             // [8..16)
++
++        /// Number of valid bytes in data (0..MAX_DATA).
++        uint64 dataLen;              // [16..24)
++
++        /// Mode byteRange: the bytes. Mode jsonField: the value's canonical JSON text. Mode size: zero.
++        Array<uint8, 512> data;      // [24..536)
++    };
++
++    /// Return query fee: 50 QU plus 10 QU per started MiB of maxFileSize, so one query can't make
++    /// every oracle machine download a large file cheaply.
++    static sint64 getQueryFee(const OracleQuery& query)
++    {
++        uint64 mib = div(query.maxFileSize + 1048575ULL, 1048576ULL);
++        return 50 + 10 * (sint64)mib;
++    }
++
++    //-------------------------------------------------------------------------
++    // Optional: convenience features for contracts using the oracle interface
++
++    /// True if the reply carries verified content.
++    static bool replyIsValid(const OracleReply& reply)
++    {
++        return reply.code == RESULT_SUCCESS;
++    }
++
++    /// True if a failed reply should be retried later rather than treated as final.
++    static bool replyIsRetriable(const OracleReply& reply)
++    {
++        return reply.code == RESULT_NOT_FOUND;
++    }
++};
+diff --git a/test/oracle_engine.cpp b/test/oracle_engine.cpp
+index 4f4b00c..7ac6ab2 100644
+--- a/test/oracle_engine.cpp
++++ b/test/oracle_engine.cpp
+@@ -2149,8 +2149,8 @@ TEST(QubicLogReadOracle, DeterministicQueryBytes)
+ }
+ 
+ // --- EvmCallRead oracle interface (generic cross-chain read of EVM state at a finalized block) ---
+-// BEGIN EvmCallRead / UtxoTxRead interface tests (self-contained: also built on Linux by the
+-// qubic-oracle-designs check, which compiles only this block against the interface registry)
++// BEGIN EvmCallRead / UtxoTxRead / ContentRead interface tests (self-contained: also built on Linux
++// by the qubic-oracle-designs check, which compiles only this block against the interface registry)
+ 
+ // Sizes and offsets are pinned so the query bytes and the reply digest stay canonical.
+ TEST(EvmCallReadOracle, DataContract)
+@@ -2395,4 +2395,117 @@ TEST(UtxoTxReadOracle, DeterministicQueryBytes)
+ 	EXPECT_EQ(compareMem(&a, &b, sizeof(U::OracleQuery)), 0);
+ }
+ 
+-// END EvmCallRead / UtxoTxRead interface tests
++// --- ContentRead oracle interface (read a file by its SHA-256 hash) ---
++
++TEST(ContentReadOracle, DataContract)
++{
++	using C = OI::ContentRead;
++
++	// registered at index 7
++	EXPECT_EQ(C::oracleInterfaceIndex, 7u);
++	EXPECT_LT(C::oracleInterfaceIndex, OI::oracleInterfacesCount);
++
++	EXPECT_LE(sizeof(C::OracleQuery), (size_t)MAX_ORACLE_QUERY_SIZE);
++	EXPECT_LE(sizeof(C::OracleReply), (size_t)MAX_ORACLE_REPLY_SIZE);
++
++	EXPECT_EQ(sizeof(C::OracleQuery), 208u);
++	EXPECT_EQ(sizeof(C::OracleReply), 536u);
++	EXPECT_EQ(offsetof(C::OracleQuery, locatorKind), 32u);
++	EXPECT_EQ(offsetof(C::OracleQuery, locatorLen), 40u);
++	EXPECT_EQ(offsetof(C::OracleQuery, locator), 48u);
++	EXPECT_EQ(offsetof(C::OracleQuery, maxFileSize), 112u);
++	EXPECT_EQ(offsetof(C::OracleQuery, mode), 120u);
++	EXPECT_EQ(offsetof(C::OracleQuery, offset), 128u);
++	EXPECT_EQ(offsetof(C::OracleQuery, length), 136u);
++	EXPECT_EQ(offsetof(C::OracleQuery, jsonPath), 144u);
++	EXPECT_EQ(offsetof(C::OracleReply, fileSize), 8u);
++	EXPECT_EQ(offsetof(C::OracleReply, dataLen), 16u);
++	EXPECT_EQ(offsetof(C::OracleReply, data), 24u);
++	EXPECT_EQ(C::MAX_DATA, 512u);
++
++	EXPECT_EQ(OI::oracleInterfaces[C::oracleInterfaceIndex].querySize, sizeof(C::OracleQuery));
++	EXPECT_EQ(OI::oracleInterfaces[C::oracleInterfaceIndex].replySize, sizeof(C::OracleReply));
++}
++
++// The fee grows with maxFileSize, so one cheap query can't make every oracle machine download a
++// large file: 50 QU + 10 QU per started MiB.
++TEST(ContentReadOracle, QueryFeeScalesWithMaxFileSize)
++{
++	using C = OI::ContentRead;
++
++	EXPECT_TRUE(OI::initOracleInterfaces());
++
++	C::OracleQuery query{};
++	query.maxFileSize = 1;
++	EXPECT_EQ(C::getQueryFee(query), 60);
++	query.maxFileSize = 1048576;
++	EXPECT_EQ(C::getQueryFee(query), 60);
++	query.maxFileSize = 1048577;
++	EXPECT_EQ(C::getQueryFee(query), 70);
++	query.maxFileSize = C::MAX_FILE_SIZE;
++	EXPECT_EQ(C::getQueryFee(query), 690);
++	query.maxFileSize = 0;
++	EXPECT_EQ(C::getQueryFee(query), 50);
++	EXPECT_GE(C::getQueryFee(query), MIN_ORACLE_QUERY_FEE);
++
++	auto* feeFunc = OI::getOracleQueryFeeFunc[C::oracleInterfaceIndex];
++	ASSERT_NE(feeFunc, nullptr);
++	query.maxFileSize = 3 * 1048576;
++	EXPECT_EQ(feeFunc(&query), 80);
++}
++
++TEST(ContentReadOracle, ResultCodesAndReplyHelpers)
++{
++	using C = OI::ContentRead;
++
++	EXPECT_EQ(C::RESULT_SUCCESS, 0u);
++	const QPI::uint64 failureCodes[] = {
++		C::RESULT_BAD_QUERY, C::RESULT_NOT_FOUND, C::RESULT_BAD_RANGE,
++		C::RESULT_NOT_JSON, C::RESULT_NO_FIELD, C::RESULT_VALUE_TOO_LARGE,
++	};
++	const unsigned n = sizeof(failureCodes) / sizeof(failureCodes[0]);
++	for (unsigned i = 0; i < n; ++i)
++	{
++		EXPECT_NE(failureCodes[i], C::RESULT_SUCCESS);
++		for (unsigned j = i + 1; j < n; ++j)
++			EXPECT_NE(failureCodes[i], failureCodes[j]);
++	}
++
++	C::OracleReply reply{};
++	reply.code = C::RESULT_SUCCESS;
++	EXPECT_TRUE(C::replyIsValid(reply));
++	reply.code = C::RESULT_NOT_FOUND;
++	EXPECT_FALSE(C::replyIsValid(reply));
++	EXPECT_TRUE(C::replyIsRetriable(reply));
++	reply.code = C::RESULT_NO_FIELD;
++	EXPECT_FALSE(C::replyIsRetriable(reply));
++}
++
++TEST(ContentReadOracle, DeterministicQueryBytes)
++{
++	using C = OI::ContentRead;
++
++	auto build = [](C::OracleQuery& q)
++	{
++		setMem(&q, sizeof(q), 0);
++		for (QPI::uint64 i = 0; i < 32; ++i)
++			q.sha256.set(i, (QPI::uint8)(0x90 + i));
++		const char cid[] = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
++		q.locatorKind = C::LocatorKind::ipfsCid;
++		q.locatorLen = sizeof(cid) - 1;
++		for (QPI::uint64 i = 0; i < q.locatorLen; ++i)
++			q.locator.set(i, (QPI::uint8)cid[i]);
++		q.maxFileSize = 4096;
++		q.mode = C::Mode::jsonField;
++		const char path[] = "meta.licence";
++		for (QPI::uint64 i = 0; i < sizeof(path) - 1; ++i)
++			q.jsonPath.set(i, (QPI::uint8)path[i]);
++	};
++
++	C::OracleQuery a, b;
++	build(a);
++	build(b);
++	EXPECT_EQ(compareMem(&a, &b, sizeof(C::OracleQuery)), 0);
++}
++
++// END EvmCallRead / UtxoTxRead / ContentRead interface tests
+-- 
+2.43.0
+

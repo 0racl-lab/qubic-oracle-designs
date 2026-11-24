@@ -1,8 +1,8 @@
 # UtxoTxRead: read a confirmed Dogecoin, Bitcoin or Litecoin payment
 
 > **Status:** implemented as patches for both repositories, tested, not yet reviewed by the core or oracle team.
-> - qubic/core: [`patches/qubic-core.patch`](../patches/qubic-core.patch), with the interface header [`oracle_interfaces/UtxoTxRead.h`](../oracle_interfaces/UtxoTxRead.h) at index 6
-> - qubic/oracle-machine: [`patches/oracle-machine.patch`](../patches/oracle-machine.patch), service `oracles/read_utxo_tx`
+> - qubic/core: [`patches/qubic-core/`](../patches/qubic-core), with the interface header [`oracle_interfaces/UtxoTxRead.h`](../oracle_interfaces/UtxoTxRead.h) at index 6
+> - qubic/oracle-machine: [`patches/oracle-machine/`](../patches/oracle-machine), service `oracles/read_utxo_tx`
 
 **In one line:** a contract asks for one output of a Dogecoin (or Bitcoin, or Litecoin) transaction. Once the transaction is buried under enough blocks, the oracle returns that output's value and script, and the block it's in.
 
