@@ -124,11 +124,13 @@ struct HttpRead
     ///   timestamp, params   as the registry recorded them for that request
     ///   field               unused, all zero
     ///   valueType, decimals the feed's
-    /// The oracle machine reads the request with the registry's GetRequest function and serves the
-    /// query only if the request is pending, its oracleQueryId is this query's id, its timestamp and
-    /// params equal the query's, and the feed's stored definition hashes to the request's
-    /// definitionHash. Otherwise it answers RESULT_SOURCE_UNSUPPORTED. The URL, the value path and the
-    /// time policy come from that definition.
+    /// The oracle machine reads the request with the registry's GetRequest function on its own node.
+    /// The registry records the request in the tick it sends the query, so a missing record is read
+    /// again every second for up to 10 seconds; if it is still missing the machine abstains. It serves
+    /// the query only if the request is pending, its oracleQueryId is this query's id, its timestamp
+    /// and params equal the query's, and the feed's stored definition hashes to the request's
+    /// definitionHash; a record that does not match is answered RESULT_SOURCE_UNSUPPORTED. The URL,
+    /// the value path and the time policy come from that definition.
     static id getFeedRegistrySourceId()
     {
         using namespace Ch;

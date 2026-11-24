@@ -164,8 +164,8 @@ When HttpRead answers, the reply is stored with the request and the consumer rea
 
 One more source in the oracle machine's `read_http` service, documented in [`HttpRead.h`](../oracle_interfaces/HttpRead.h). For this source each oracle machine:
 
-1. Reads the request with the registry's `GetRequest(endpoint)` function. Contract state is public: anyone can read it through Qubic's RPC, the way explorers do. A machine should use its own Bob node.
-2. Serves the query only if the request is pending, **its oracle query id is this query's id**, and its timestamp and parameters equal the query's. A query sent straight to HttpRead, bypassing the registry and its fee, has no such record and is refused. This is what makes fees and restrictions hold: the registry knows who called it, while an oracle machine is never told who sent a query.
+1. Reads the request with the registry's `GetRequest(endpoint)` function, through its own computor node (computor operators run the oracle machines, so each has one; no explorer or outside server is involved). The registry writes the request in the same tick it sends the query, so if the record isn't there yet the machine **waits a second and reads again, for up to 10 seconds**, then abstains. That is well inside the 120-second query timeout, and it removes any dependence on exactly when the node exposes that tick's state.
+2. Serves the query only if the request is pending, **its oracle query id is this query's id**, and its timestamp and parameters equal the query's. A record that exists but doesn't match is answered `SOURCE_UNSUPPORTED`; every machine reads the same record, so they agree. A query sent straight to HttpRead, bypassing the registry and its fee, has no record at all: machines abstain and it times out, with nothing fetched. This is what makes fees and restrictions hold: the registry knows who called it, while an oracle machine is never told who sent a query.
 3. Reads the feed with `GetFeed` and checks that its stored definition hashes to the `definitionHash` recorded with the request. A stale or tampered read can only cause a refusal, never a fetch with a different definition.
 4. Checks the parameters against their kinds again, fills in the template and fetches under the service's **hard-coded safety policy**:
    - GET only;
@@ -186,8 +186,7 @@ One more source in the oracle machine's `read_http` service, documented in [`Htt
 
 ### What has to be agreed first
 
-- **Oracle machines reading contract state.** The state itself is public; the new part is that an oracle service would depend on it to decide what to fetch. Today services read outside sources and Qubic logs. Because of the query id and hash checks, a wrong or stale read can only cause a refusal, never a wrong fetch. It's still the core team's decision.
-- **Timing.** The registry writes the request in the same tick it sends the query, so a machine must read state at or after that tick. Whether machines see the query before their node has that tick's state is a question for the oracle team.
+- **Oracle machines reading contract state.** The state itself is public, and each oracle machine reads it from its own computor's node. The new part is that an oracle service would depend on it to decide what to fetch; today services read outside sources and Qubic logs. Because of the query id and hash checks, and the retry, a stale read can only delay or refuse an answer, never cause a wrong fetch. It's still the core team's call, but it needs no core change.
 - **Order of work:** HttpRead and its `read_http` service first (phases 1 to 3). Then the `feedreg` source and the FeedRegistry contract proposal together, since neither is useful alone.
 - **Responsibility:** a voted-in feed is only as good as its source. Shareholders take on the job of not approving feeds that misbehave, and of retiring ones that do.
 
