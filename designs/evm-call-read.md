@@ -1,7 +1,8 @@
 # EvmCallRead: read EVM contract state at a finalized block
 
-> **Status:** design sketch. Not part of qubic/core, not reviewed by the core or oracle team.
-> Interface header: [`oracle_interfaces/EvmCallRead.h`](../oracle_interfaces/EvmCallRead.h)
+> **Status:** implemented as patches for both repositories, tested, not yet reviewed by the core or oracle team.
+> - qubic/core: [`patches/qubic-core.patch`](../patches/qubic-core.patch), with the interface header [`oracle_interfaces/EvmCallRead.h`](../oracle_interfaces/EvmCallRead.h) at index 5
+> - qubic/oracle-machine: [`patches/oracle-machine.patch`](../patches/oracle-machine.patch), service `oracles/read_evm_call`
 
 **In one line:** a contract asks for a read-only call to an EVM contract at a specific finalized block (for example `balanceOf(x)` on Base at block N), and the oracle returns the raw result.
 
@@ -18,10 +19,11 @@ EvmLogRead proves that something **happened** (an event was emitted). EvmCallRea
 ## How it works
 
 1. A contract sends a query: the chain id, a block number, the target contract, and ABI-encoded calldata (selector plus arguments, up to 512 bytes).
-2. Every oracle machine checks that the block is at or below the chain's **finalized** block. If not, it answers `BLOCK_NOT_FINALIZED`.
-3. It runs `eth_call` against that exact block with a fixed gas cap (10 million) and no state overrides.
-4. It returns the block's hash, whether the call reverted, and up to 512 bytes of return data (or revert data).
-5. On any failure it zeroes every field except `code`.
+2. Every oracle machine checks that the block is at or below the **finalized** head on every one of its RPC endpoints. If not, it answers `BLOCK_NOT_FINALIZED`.
+3. It resolves the block number to a block hash on every endpoint and requires them to agree.
+4. It runs `eth_call` pinned to that hash (EIP-1898, `requireCanonical`), from the zero address, with exactly 10 million gas and no state overrides. Every endpoint must return the same outcome, or the machine abstains.
+5. It returns the block's hash, whether the call reverted, and up to 512 bytes of return data (or revert data).
+6. On any failure it zeroes every field except `code`.
 
 ## Query and reply
 
@@ -36,7 +38,7 @@ Query: 568 bytes. Reply: 568 bytes, made up of `code`, `blockHash`, `reverted`, 
 
 **Result codes:** `SUCCESS`, `BAD_QUERY`, `CHAIN_UNSUPPORTED`, `BLOCK_NOT_FINALIZED` (retriable), `BLOCK_TOO_OLD`, `OUT_OF_GAS`, `RETURN_TOO_LARGE`.
 
-A call that **reverts** is a deterministic result, not a failure. It comes back as `SUCCESS` with `reverted = 1` and the revert data, so a contract can tell "the call failed" apart from "the oracle couldn't answer".
+A call that **reverts** is a deterministic result, not a failure. It comes back as `SUCCESS` with `reverted = 1` and the revert data, so a contract can tell "the call failed" apart from "the oracle couldn't answer". Other EVM execution failures (invalid opcode, bad jump, stack errors) come back the same way with empty data. Any node error the service doesn't recognise makes it abstain rather than guess.
 
 ## Why every machine gives the same answer
 
@@ -66,6 +68,23 @@ State at a fixed, finalized block never changes. With the same block, the same c
 - **512 bytes of return data.** Enough for balances, owners and small structs, but not for large arrays.
 - **Recent blocks only** without archive nodes.
 - **Freshness:** "now" in practice means the latest finalized block, minutes behind the chain tip on rollups.
+
+## Tests
+
+- **qubic/core:** 4 tests in `test/oracle_engine.cpp`, in the same style as EvmLogRead's:
+  - registration at index 5;
+  - pinned sizes and field offsets;
+  - fee through the registry;
+  - the same chain ids as EvmLogRead;
+  - result codes and reply helpers;
+  - deterministic `balanceOf` query bytes.
+- **oracle-machine:** a selftest against mock EVM nodes that only answer the exact required call (zero sender, gas cap, hash pin). Its 29 checks cover:
+  - `balanceOf`, a revert with `Error(string)` data, an invalid opcode, an address with no code;
+  - not finalized, too old, out of gas, oversized return;
+  - five malformed queries;
+  - disagreement, an unrecognised node error, a dead endpoint;
+  - `latest - N` finality and the TCP framing.
+- `live_check.py` runs one real `balanceOf` against live endpoints.
 
 ## Open questions
 

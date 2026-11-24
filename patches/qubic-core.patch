@@ -1,0 +1,676 @@
+From c06960c152d3de7a53366de6e49671d0d025c861 Mon Sep 17 00:00:00 2001
+From: Oracl <oracl@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:09:24 +0000
+Subject: [PATCH] Add oracle interfaces EvmCallRead (5) and UtxoTxRead (6)
+
+EvmCallRead: read EVM contract state (eth_call) at a finalized block, pinned
+by block hash. UtxoTxRead: one output of a confirmed Dogecoin / Bitcoin /
+Litecoin transaction. Both follow EvmLogRead's conventions: fixed layouts,
+code field with all-zero failure replies, retriable time-varying codes.
+Registered in oracle_interfaces_def.h; tests added to test/oracle_engine.cpp.
+Reference services: oracle-machine oracles/read_evm_call, oracles/read_utxo_tx.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ src/Qubic.vcxproj                       |   2 +
+ src/Qubic.vcxproj.filters               |   6 +
+ src/oracle_core/oracle_interfaces_def.h |  12 ++
+ src/oracle_interfaces/EvmCallRead.h     | 143 ++++++++++++++
+ src/oracle_interfaces/UtxoTxRead.h      | 169 ++++++++++++++++
+ test/oracle_engine.cpp                  | 249 ++++++++++++++++++++++++
+ 6 files changed, 581 insertions(+)
+ create mode 100644 src/oracle_interfaces/EvmCallRead.h
+ create mode 100644 src/oracle_interfaces/UtxoTxRead.h
+
+diff --git a/src/Qubic.vcxproj b/src/Qubic.vcxproj
+index a53a80b..76e9f72 100644
+--- a/src/Qubic.vcxproj
++++ b/src/Qubic.vcxproj
+@@ -123,6 +123,8 @@
+     <ClInclude Include="oc_core\snapshot_files.h" />
+     <ClInclude Include="oc_interfaces\Mock.h" />
+     <ClInclude Include="oracle_interfaces\QubicLogRead.h" />
++    <ClInclude Include="oracle_interfaces\EvmCallRead.h" />
++    <ClInclude Include="oracle_interfaces\UtxoTxRead.h" />
+     <ClInclude Include="platform\assert.h" />
+     <ClInclude Include="platform\concurrency.h" />
+     <ClInclude Include="four_q.h" />
+diff --git a/src/Qubic.vcxproj.filters b/src/Qubic.vcxproj.filters
+index 2a9d5f3..64e66b4 100644
+--- a/src/Qubic.vcxproj.filters
++++ b/src/Qubic.vcxproj.filters
+@@ -469,6 +469,12 @@
+     <ClInclude Include="oracle_interfaces\QubicLogRead.h">
+       <Filter>oracle_interfaces</Filter>
+ 	</ClInclude>
++    <ClInclude Include="oracle_interfaces\EvmCallRead.h">
++      <Filter>oracle_interfaces</Filter>
++    </ClInclude>
++    <ClInclude Include="oracle_interfaces\UtxoTxRead.h">
++      <Filter>oracle_interfaces</Filter>
++    </ClInclude>
+     <ClInclude Include="optimizations\opt_parallel_sign_votes.h">
+       <Filter>optimizations</Filter>
+     </ClInclude>
+diff --git a/src/oracle_core/oracle_interfaces_def.h b/src/oracle_core/oracle_interfaces_def.h
+index db22134..d386b21 100644
+--- a/src/oracle_core/oracle_interfaces_def.h
++++ b/src/oracle_core/oracle_interfaces_def.h
+@@ -25,6 +25,14 @@ namespace OI
+ #include "oracle_interfaces/QubicLogRead.h"
+ #undef ORACLE_INTERFACE_INDEX
+ 
++#define ORACLE_INTERFACE_INDEX 5
++#include "oracle_interfaces/EvmCallRead.h"
++#undef ORACLE_INTERFACE_INDEX
++
++#define ORACLE_INTERFACE_INDEX 6
++#include "oracle_interfaces/UtxoTxRead.h"
++#undef ORACLE_INTERFACE_INDEX
++
+ // add new interface above this line (define ORACLE_INTERFACE_INDEX, include the header file and undef ORACLE_INTERFACE_INDEX)
+ 
+ #define DEFINE_ORACLE_INTERFACE(Interface) {sizeof(Interface::OracleQuery), sizeof(Interface::OracleReply)}
+@@ -38,6 +46,8 @@ namespace OI
+ 		DEFINE_ORACLE_INTERFACE(DogeShareValidation),
+ 		DEFINE_ORACLE_INTERFACE(EvmLogRead),
+ 		DEFINE_ORACLE_INTERFACE(QubicLogRead),
++		DEFINE_ORACLE_INTERFACE(EvmCallRead),
++		DEFINE_ORACLE_INTERFACE(UtxoTxRead),
+ 		// add new interface above this line (with DEFINE_ORACLE_INTERFACE; the order must match the interfaces indices)
+ 	};
+ 
+@@ -70,6 +80,8 @@ namespace OI
+ 		REGISTER_ORACLE_INTERFACE(DogeShareValidation);
+ 		REGISTER_ORACLE_INTERFACE(EvmLogRead);
+ 		REGISTER_ORACLE_INTERFACE(QubicLogRead);
++		REGISTER_ORACLE_INTERFACE(EvmCallRead);
++		REGISTER_ORACLE_INTERFACE(UtxoTxRead);
+ 		// add new interface above this line (with REGISTER_ORACLE_INTERFACE)
+ 
+ 		for (uint32_t idx = 0; idx < oracleInterfacesCount; ++idx)
+diff --git a/src/oracle_interfaces/EvmCallRead.h b/src/oracle_interfaces/EvmCallRead.h
+new file mode 100644
+index 0000000..c983b13
+--- /dev/null
++++ b/src/oracle_interfaces/EvmCallRead.h
+@@ -0,0 +1,143 @@
++using namespace QPI;
++
++/**
++* Oracle interface "EvmCallRead" (see Price.h for general documentation about oracle interfaces).
++*
++* Generic cross-chain read of EVM contract STATE at a FINALIZED block. Given (chainId, blockNumber,
++* to, calldata) the oracle machine runs one read-only eth_call against exactly that block and returns
++* the raw return data. Typical calls: balanceOf(address), ownerOf(tokenId), totalSupply(), a reserve
++* or price getter. No ABI semantics are baked in: the querying contract encodes the calldata and
++* decodes the result itself.
++*
++* It complements EvmLogRead: EvmLogRead proves that something HAPPENED (an event was emitted),
++* EvmCallRead reads what something IS at a fixed block.
++*
++* Determinism requirement (see Price.h): state at a fixed past block never changes, so the result is
++* the same on every machine. The oracle machine MUST
++*   - refuse blocks above the chain's finalized head (RESULT_BLOCK_NOT_FINALIZED),
++*   - pin the call to the block HASH it resolved (EIP-1898) and return that hash,
++*   - call from the zero address with exactly GAS_CAP gas and no state overrides,
++*   - zero all reply fields except code on failure.
++* A call that reverts is a deterministic outcome: it is returned as RESULT_SUCCESS with reverted = 1
++* and the revert data.
++*
++* Served by oracle-machine oracles/read_evm_call (568-byte query, 568-byte reply).
++*/
++struct EvmCallRead
++{
++    //-------------------------------------------------------------------------
++    // Mandatory oracle interface definitions
++
++    /// Chain ids (decimal) of supported EVM networks: the same set as EvmLogRead.
++    struct ChainId
++    {
++        static constexpr uint64 ethereum  = 1;       // 0x1
++        static constexpr uint64 optimism  = 10;      // 0xa
++        static constexpr uint64 bsc       = 56;      // 0x38
++        static constexpr uint64 polygon   = 137;     // 0x89
++        static constexpr uint64 fantom    = 250;     // 0xfa
++        static constexpr uint64 base      = 8453;    // 0x2105
++        static constexpr uint64 avalanche = 43114;   // 0xa86a
++        static constexpr uint64 arbitrum  = 42161;   // 0xa4b1
++        static constexpr uint64 sepolia   = 11155111;// 0xaa36a7 (Ethereum Sepolia testnet)
++        // add new chain ids above this line
++    };
++
++    /// Return true if the chain id is one this oracle is expected to serve.
++    static bool isSupportedChain(uint64 chainId)
++    {
++        return chainId == ChainId::ethereum
++            || chainId == ChainId::optimism
++            || chainId == ChainId::bsc
++            || chainId == ChainId::polygon
++            || chainId == ChainId::fantom
++            || chainId == ChainId::base
++            || chainId == ChainId::avalanche
++            || chainId == ChainId::arbitrum
++            || chainId == ChainId::sepolia;
++    }
++
++    /// Oracle interface index
++    static constexpr uint32 oracleInterfaceIndex = ORACLE_INTERFACE_INDEX;
++
++    //--- Result codes returned in OracleReply.code. 0 means success; any non-zero value is a failure
++    //    reason and implies all other reply fields are all-zero.
++    static constexpr uint64 RESULT_SUCCESS             = 0;  ///< call executed at the block (it may have reverted, see reverted)
++    static constexpr uint64 RESULT_BAD_QUERY           = 1;  ///< malformed query (bad target word, calldataLen outside 4..512, dirty padding)
++    static constexpr uint64 RESULT_CHAIN_UNSUPPORTED   = 2;  ///< chainId not served by this oracle
++    static constexpr uint64 RESULT_BLOCK_NOT_FINALIZED = 3;  ///< blockNumber above the finalized head
++    static constexpr uint64 RESULT_BLOCK_TOO_OLD       = 4;  ///< block older than STATE_WINDOW_SECONDS before the finalized head
++    static constexpr uint64 RESULT_OUT_OF_GAS          = 5;  ///< the call needed more than GAS_CAP
++    static constexpr uint64 RESULT_RETURN_TOO_LARGE    = 6;  ///< return or revert data longer than 512 bytes
++    // add new result codes above this line
++    //
++    // Code 3 is a time-varying observation: retry later. Codes 3/4 are boundaries that move with the
++    // finalized head; near them computors may split and the query just times out.
++
++    /// Gas available to the call. Fixed, so every machine stops at the same point.
++    static constexpr uint64 GAS_CAP = 10000000ULL;
++
++    /// Oldest state oracle machines must serve, measured back from the finalized head's timestamp.
++    /// About a day: "state at a recent finalized block" without requiring archive nodes.
++    static constexpr uint64 STATE_WINDOW_SECONDS = 86400ULL;
++
++    /// Oracle query data / input to the oracle machine. Fixed 568 bytes.
++    struct OracleQuery
++    {
++        /// EVM chain id (decimal), e.g. EvmCallRead::ChainId::base.
++        uint64 chainId;              // [0..8)
++
++        /// Block whose state is read. Must be at or below the chain's finalized head.
++        uint64 blockNumber;          // [8..16)
++
++        /// Contract to call: 20-byte address right-aligned into a 32-byte word (upper 12 bytes zero).
++        Array<uint8, 32> to;         // [16..48)
++
++        /// Number of valid bytes in calldata (4..512).
++        uint64 calldataLen;          // [48..56)
++
++        /// ABI-encoded calldata (4-byte selector + arguments); bytes beyond calldataLen MUST be zero.
++        Array<uint8, 512> calldata;  // [56..568)
++    };
++
++    /// Oracle reply data / output of the oracle machine. Fixed 568 bytes.
++    /// On failure (code != RESULT_SUCCESS) all other fields MUST be all-zero.
++    struct OracleReply
++    {
++        /// One of the RESULT_* codes above.
++        uint64 code;                 // [0..8)
++
++        /// Hash of the block that was read (32-byte big-endian), tying the answer to one history.
++        Array<uint8, 32> blockHash;  // [8..40)
++
++        /// 1 if the call reverted (data then holds the revert data), else 0.
++        uint64 reverted;             // [40..48)
++
++        /// Number of valid bytes in data (0..512).
++        uint64 dataLen;              // [48..56)
++
++        /// Raw return data (or revert data), zero-padded beyond dataLen.
++        Array<uint8, 512> data;      // [56..568)
++    };
++
++    /// Return query fee. Cross-chain reads are comparatively expensive (same as EvmLogRead).
++    static sint64 getQueryFee(const OracleQuery& query)
++    {
++        return 1000;
++    }
++
++    //-------------------------------------------------------------------------
++    // Optional: convenience features for contracts using the oracle interface
++
++    /// True if the call ran at the block and returned normally (did not revert).
++    static bool replyIsValid(const OracleReply& reply)
++    {
++        return reply.code == RESULT_SUCCESS && reply.reverted == 0;
++    }
++
++    /// True if a failed reply should be retried later rather than treated as final.
++    static bool replyIsRetriable(const OracleReply& reply)
++    {
++        return reply.code == RESULT_BLOCK_NOT_FINALIZED;
++    }
++};
+diff --git a/src/oracle_interfaces/UtxoTxRead.h b/src/oracle_interfaces/UtxoTxRead.h
+new file mode 100644
+index 0000000..977d806
+--- /dev/null
++++ b/src/oracle_interfaces/UtxoTxRead.h
+@@ -0,0 +1,169 @@
++using namespace QPI;
++
++/**
++* Oracle interface "UtxoTxRead" (see Price.h for general documentation about oracle interfaces).
++*
++* Generic read of ONE output of a confirmed transaction on a Bitcoin-family (UTXO) chain: Dogecoin,
++* Bitcoin and Litecoin, plus their test networks. Given (network, txid, outputIndex,
++* minConfirmations) the oracle machine returns that output's value in base units (koinu / satoshis /
++* litoshis) and its raw scriptPubKey, plus the block it was confirmed in. No address formats or
++* semantics are baked in: the querying contract compares the raw script with the one it expects, or
++* reads an OP_RETURN output's data itself. It is the UTXO sibling of EvmLogRead.
++*
++* Determinism requirement (see Price.h): the oracle machine MUST only answer once the transaction's
++* block has at least minConfirmations confirmations on EVERY configured node (RESULT_NOT_CONFIRMED
++* otherwise), so every honest machine sees the same block and the same output, and MUST zero all
++* reply fields except code on failure. Around the confirmation boundary computors may split and the
++* query just times out; retrying is the querier's job.
++*
++* Deliberately NOT returned: whether the output has been spent since. That changes over time and
++* would break agreement between machines.
++*
++* Served by oracle-machine oracles/read_utxo_tx (56-byte query, 208-byte reply). The service reads
++* the chain's own node software over its standard JSON-RPC (dogecoind / bitcoind / litecoind with
++* txindex=1), which all three chains share.
++*/
++struct UtxoTxRead
++{
++    //-------------------------------------------------------------------------
++    // Mandatory oracle interface definitions
++
++    /// Networks. 0 is deliberately invalid, so an all-zero query is rejected.
++    struct Network
++    {
++        static constexpr uint64 bitcoin         = 1;
++        static constexpr uint64 dogecoin        = 2;
++        static constexpr uint64 litecoin        = 3;
++        static constexpr uint64 bitcoinTestnet4 = 101;
++        static constexpr uint64 dogecoinTestnet = 102;
++        static constexpr uint64 litecoinTestnet = 103;
++        // add new networks above this line
++    };
++
++    /// Return true if the network is one this oracle is expected to serve.
++    static bool isSupportedNetwork(uint64 network)
++    {
++        return network == Network::bitcoin
++            || network == Network::dogecoin
++            || network == Network::litecoin
++            || network == Network::bitcoinTestnet4
++            || network == Network::dogecoinTestnet
++            || network == Network::litecoinTestnet;
++    }
++
++    /// Smallest confirmation depth a query may ask for on a network (0 if unsupported). Faster
++    /// chains need more blocks for similar safety: about 30 min on Bitcoin, 10 on Dogecoin, 15 on
++    /// Litecoin. Test networks accept 1.
++    static uint64 minConfirmationsFor(uint64 network)
++    {
++        if (network == Network::bitcoin)
++        {
++            return 3;
++        }
++        if (network == Network::dogecoin)
++        {
++            return 10;
++        }
++        if (network == Network::litecoin)
++        {
++            return 6;
++        }
++        if (network == Network::bitcoinTestnet4 || network == Network::dogecoinTestnet || network == Network::litecoinTestnet)
++        {
++            return 1;
++        }
++        return 0;
++    }
++
++    /// Largest confirmation depth a query may ask for.
++    static constexpr uint64 MAX_CONFIRMATIONS = 1000;
++
++    /// Oracle interface index
++    static constexpr uint32 oracleInterfaceIndex = ORACLE_INTERFACE_INDEX;
++
++    //--- Result codes returned in OracleReply.code. 0 means success; any non-zero value is a failure
++    //    reason and implies all other reply fields are all-zero.
++    static constexpr uint64 RESULT_SUCCESS             = 0;  ///< output found under enough confirmations; reply fields valid
++    static constexpr uint64 RESULT_BAD_QUERY           = 1;  ///< malformed query (zero txid, minConfirmations out of range)
++    static constexpr uint64 RESULT_NETWORK_UNSUPPORTED = 2;  ///< network not served by this oracle
++    static constexpr uint64 RESULT_TX_NOT_FOUND        = 3;  ///< no node knows the transaction
++    static constexpr uint64 RESULT_NOT_CONFIRMED       = 4;  ///< in the mempool, or fewer than minConfirmations on some node
++    static constexpr uint64 RESULT_OUTPUT_OUT_OF_RANGE = 5;  ///< outputIndex >= number of outputs
++    static constexpr uint64 RESULT_SCRIPT_TOO_LARGE    = 6;  ///< scriptPubKey longer than 128 bytes
++    // add new result codes above this line
++    //
++    // Codes 3/4 are time-varying observations: treat as retriable, never proof of absence.
++
++    /// Oracle query data / input to the oracle machine. Fixed 56 bytes.
++    struct OracleQuery
++    {
++        /// One of Network.
++        uint64 network;              // [0..8)
++
++        /// Transaction id in display order (as block explorers and the node's RPC show it).
++        Array<uint8, 32> txid;       // [8..40)
++
++        /// Index of the output (vout) to return.
++        uint64 outputIndex;          // [40..48)
++
++        /// Depth required before answering: minConfirmationsFor(network)..MAX_CONFIRMATIONS.
++        uint64 minConfirmations;     // [48..56)
++    };
++
++    /// Oracle reply data / output of the oracle machine. Fixed 208 bytes.
++    /// On failure (code != RESULT_SUCCESS) all other fields MUST be all-zero.
++    struct OracleReply
++    {
++        /// One of the RESULT_* codes above.
++        uint64 code;                 // [0..8)
++
++        /// Hash of the block containing the transaction, display order.
++        Array<uint8, 32> blockHash;  // [8..40)
++
++        /// Height of that block.
++        uint64 blockHeight;          // [40..48)
++
++        /// That block's header timestamp (Unix seconds).
++        uint64 blockTime;            // [48..56)
++
++        /// Number of outputs in the transaction.
++        uint64 outputCount;          // [56..64)
++
++        /// Value of the requested output in base units (1 DOGE = 100,000,000 koinu; 1 BTC = 100,000,000 sat).
++        uint64 value;                // [64..72)
++
++        /// Number of valid bytes in script (0..128).
++        uint64 scriptLen;            // [72..80)
++
++        /// Raw scriptPubKey of the output, zero-padded (P2PKH 25, P2SH 23, P2WPKH 22, P2TR 34, OP_RETURN <= 83).
++        Array<uint8, 128> script;    // [80..208)
++    };
++
++    /// Return query fee. Cross-chain reads are comparatively expensive (same as EvmLogRead).
++    static sint64 getQueryFee(const OracleQuery& query)
++    {
++        return 1000;
++    }
++
++    //-------------------------------------------------------------------------
++    // Optional: convenience features for contracts using the oracle interface
++
++    /// True if the query is well-formed for this interface (contracts can check before paying).
++    static bool queryIsWellFormed(const OracleQuery& query)
++    {
++        uint64 minConf = minConfirmationsFor(query.network);
++        return minConf != 0 && query.minConfirmations >= minConf && query.minConfirmations <= MAX_CONFIRMATIONS;
++    }
++
++    /// True if the reply carries a usable output.
++    static bool replyIsValid(const OracleReply& reply)
++    {
++        return reply.code == RESULT_SUCCESS;
++    }
++
++    /// True if a failed reply should be retried later rather than treated as final.
++    static bool replyIsRetriable(const OracleReply& reply)
++    {
++        return reply.code == RESULT_TX_NOT_FOUND || reply.code == RESULT_NOT_CONFIRMED;
++    }
++};
+diff --git a/test/oracle_engine.cpp b/test/oracle_engine.cpp
+index 15c2ab2..4f4b00c 100644
+--- a/test/oracle_engine.cpp
++++ b/test/oracle_engine.cpp
+@@ -2147,3 +2147,252 @@ TEST(QubicLogReadOracle, DeterministicQueryBytes)
+ 	build(b);
+ 	EXPECT_EQ(compareMem(&a, &b, sizeof(Q::OracleQuery)), 0);
+ }
++
++// --- EvmCallRead oracle interface (generic cross-chain read of EVM state at a finalized block) ---
++// BEGIN EvmCallRead / UtxoTxRead interface tests (self-contained: also built on Linux by the
++// qubic-oracle-designs check, which compiles only this block against the interface registry)
++
++// Sizes and offsets are pinned so the query bytes and the reply digest stay canonical.
++TEST(EvmCallReadOracle, DataContract)
++{
++	using E = OI::EvmCallRead;
++
++	// registered at index 5
++	EXPECT_EQ(E::oracleInterfaceIndex, 5u);
++	EXPECT_LT(E::oracleInterfaceIndex, OI::oracleInterfacesCount);
++
++	// fits within transaction limits
++	EXPECT_LE(sizeof(E::OracleQuery), (size_t)MAX_ORACLE_QUERY_SIZE);
++	EXPECT_LE(sizeof(E::OracleReply), (size_t)MAX_ORACLE_REPLY_SIZE);
++
++	// pinned sizes and offsets (no padding holes)
++	EXPECT_EQ(sizeof(E::OracleQuery), 568u);
++	EXPECT_EQ(sizeof(E::OracleReply), 568u);
++	EXPECT_EQ(offsetof(E::OracleQuery, blockNumber), 8u);
++	EXPECT_EQ(offsetof(E::OracleQuery, to), 16u);
++	EXPECT_EQ(offsetof(E::OracleQuery, calldataLen), 48u);
++	EXPECT_EQ(offsetof(E::OracleQuery, calldata), 56u);
++	EXPECT_EQ(offsetof(E::OracleReply, blockHash), 8u);
++	EXPECT_EQ(offsetof(E::OracleReply, reverted), 40u);
++	EXPECT_EQ(offsetof(E::OracleReply, dataLen), 48u);
++	EXPECT_EQ(offsetof(E::OracleReply, data), 56u);
++
++	// registry size table matches the actual structs
++	EXPECT_EQ(OI::oracleInterfaces[E::oracleInterfaceIndex].querySize, sizeof(E::OracleQuery));
++	EXPECT_EQ(OI::oracleInterfaces[E::oracleInterfaceIndex].replySize, sizeof(E::OracleReply));
++}
++
++TEST(EvmCallReadOracle, QueryFeeAndChains)
++{
++	using E = OI::EvmCallRead;
++
++	EXPECT_TRUE(OI::initOracleInterfaces());
++
++	E::OracleQuery query{};
++	query.chainId = E::ChainId::base;
++	EXPECT_EQ(E::getQueryFee(query), 1000);
++	EXPECT_GE(E::getQueryFee(query), MIN_ORACLE_QUERY_FEE);
++	auto* feeFunc = OI::getOracleQueryFeeFunc[E::oracleInterfaceIndex];
++	ASSERT_NE(feeFunc, nullptr);
++	EXPECT_EQ(feeFunc(&query), 1000);
++
++	// the same chains as EvmLogRead, with the same ids
++	const QPI::uint64 chains[] = { 1, 10, 56, 137, 250, 8453, 43114, 42161, 11155111 };
++	for (QPI::uint64 c : chains)
++	{
++		EXPECT_TRUE(E::isSupportedChain(c));
++		EXPECT_EQ(E::isSupportedChain(c), OI::EvmLogRead::isSupportedChain(c));
++	}
++	EXPECT_FALSE(E::isSupportedChain(0));
++	EXPECT_FALSE(E::isSupportedChain(2));
++	EXPECT_FALSE(E::isSupportedChain(999999));
++}
++
++TEST(EvmCallReadOracle, ResultCodesAndReplyHelpers)
++{
++	using E = OI::EvmCallRead;
++
++	EXPECT_EQ(E::RESULT_SUCCESS, 0u);
++	const QPI::uint64 failureCodes[] = {
++		E::RESULT_BAD_QUERY, E::RESULT_CHAIN_UNSUPPORTED, E::RESULT_BLOCK_NOT_FINALIZED,
++		E::RESULT_BLOCK_TOO_OLD, E::RESULT_OUT_OF_GAS, E::RESULT_RETURN_TOO_LARGE,
++	};
++	const unsigned n = sizeof(failureCodes) / sizeof(failureCodes[0]);
++	for (unsigned i = 0; i < n; ++i)
++	{
++		EXPECT_NE(failureCodes[i], E::RESULT_SUCCESS);
++		for (unsigned j = i + 1; j < n; ++j)
++			EXPECT_NE(failureCodes[i], failureCodes[j]);
++	}
++
++	E::OracleReply reply{};
++	reply.code = E::RESULT_SUCCESS;
++	EXPECT_TRUE(E::replyIsValid(reply));
++	reply.reverted = 1;                         // a revert is a result, but not a usable return value
++	EXPECT_FALSE(E::replyIsValid(reply));
++	EXPECT_FALSE(E::replyIsRetriable(reply));
++	reply.reverted = 0;
++	reply.code = E::RESULT_BLOCK_NOT_FINALIZED;
++	EXPECT_FALSE(E::replyIsValid(reply));
++	EXPECT_TRUE(E::replyIsRetriable(reply));
++	reply.code = E::RESULT_OUT_OF_GAS;
++	EXPECT_FALSE(E::replyIsRetriable(reply));
++}
++
++// balanceOf(address) as a contract would build it: identical logical values give identical bytes.
++TEST(EvmCallReadOracle, DeterministicQueryBytes)
++{
++	using E = OI::EvmCallRead;
++
++	auto build = [](E::OracleQuery& q)
++	{
++		setMem(&q, sizeof(q), 0);
++		q.chainId = E::ChainId::base;
++		q.blockNumber = 23000000;
++		for (QPI::uint64 i = 12; i < 32; ++i)
++			q.to.set(i, (QPI::uint8)(0xA0 + i));
++		const QPI::uint8 selector[4] = { 0x70, 0xa0, 0x82, 0x31 };   // balanceOf(address)
++		for (QPI::uint64 i = 0; i < 4; ++i)
++			q.calldata.set(i, selector[i]);
++		for (QPI::uint64 i = 0; i < 20; ++i)
++			q.calldata.set(4 + 12 + i, (QPI::uint8)(i + 1));
++		q.calldataLen = 36;
++	};
++
++	E::OracleQuery a, b;
++	build(a);
++	build(b);
++	EXPECT_EQ(compareMem(&a, &b, sizeof(E::OracleQuery)), 0);
++
++	unsigned char buffer[MAX_ORACLE_QUERY_SIZE];
++	setMem(buffer, sizeof(buffer), 0);
++	copyMem(buffer, &a, sizeof(a));
++	E::OracleQuery roundtrip{};
++	copyMem(&roundtrip, buffer, sizeof(roundtrip));
++	EXPECT_EQ(compareMem(&a, &roundtrip, sizeof(E::OracleQuery)), 0);
++}
++
++// --- UtxoTxRead oracle interface (one output of a confirmed Dogecoin / Bitcoin / Litecoin tx) ---
++
++TEST(UtxoTxReadOracle, DataContract)
++{
++	using U = OI::UtxoTxRead;
++
++	// registered at index 6
++	EXPECT_EQ(U::oracleInterfaceIndex, 6u);
++	EXPECT_LT(U::oracleInterfaceIndex, OI::oracleInterfacesCount);
++
++	EXPECT_LE(sizeof(U::OracleQuery), (size_t)MAX_ORACLE_QUERY_SIZE);
++	EXPECT_LE(sizeof(U::OracleReply), (size_t)MAX_ORACLE_REPLY_SIZE);
++
++	EXPECT_EQ(sizeof(U::OracleQuery), 56u);
++	EXPECT_EQ(sizeof(U::OracleReply), 208u);
++	EXPECT_EQ(offsetof(U::OracleQuery, txid), 8u);
++	EXPECT_EQ(offsetof(U::OracleQuery, outputIndex), 40u);
++	EXPECT_EQ(offsetof(U::OracleQuery, minConfirmations), 48u);
++	EXPECT_EQ(offsetof(U::OracleReply, blockHash), 8u);
++	EXPECT_EQ(offsetof(U::OracleReply, blockHeight), 40u);
++	EXPECT_EQ(offsetof(U::OracleReply, blockTime), 48u);
++	EXPECT_EQ(offsetof(U::OracleReply, outputCount), 56u);
++	EXPECT_EQ(offsetof(U::OracleReply, value), 64u);
++	EXPECT_EQ(offsetof(U::OracleReply, scriptLen), 72u);
++	EXPECT_EQ(offsetof(U::OracleReply, script), 80u);
++
++	EXPECT_EQ(OI::oracleInterfaces[U::oracleInterfaceIndex].querySize, sizeof(U::OracleQuery));
++	EXPECT_EQ(OI::oracleInterfaces[U::oracleInterfaceIndex].replySize, sizeof(U::OracleReply));
++}
++
++TEST(UtxoTxReadOracle, QueryFeeNetworksAndDepth)
++{
++	using U = OI::UtxoTxRead;
++
++	EXPECT_TRUE(OI::initOracleInterfaces());
++
++	U::OracleQuery query{};
++	query.network = U::Network::dogecoin;
++	EXPECT_EQ(U::getQueryFee(query), 1000);
++	EXPECT_GE(U::getQueryFee(query), MIN_ORACLE_QUERY_FEE);
++	auto* feeFunc = OI::getOracleQueryFeeFunc[U::oracleInterfaceIndex];
++	ASSERT_NE(feeFunc, nullptr);
++	EXPECT_EQ(feeFunc(&query), 1000);
++
++	// networks: 0 is invalid so an all-zero query never names a chain
++	EXPECT_FALSE(U::isSupportedNetwork(0));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::bitcoin));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::dogecoin));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::litecoin));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::bitcoinTestnet4));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::dogecoinTestnet));
++	EXPECT_TRUE(U::isSupportedNetwork(U::Network::litecoinTestnet));
++	EXPECT_FALSE(U::isSupportedNetwork(4));
++
++	// per-network minimum depth
++	EXPECT_EQ(U::minConfirmationsFor(U::Network::bitcoin), 3u);
++	EXPECT_EQ(U::minConfirmationsFor(U::Network::dogecoin), 10u);
++	EXPECT_EQ(U::minConfirmationsFor(U::Network::litecoin), 6u);
++	EXPECT_EQ(U::minConfirmationsFor(U::Network::dogecoinTestnet), 1u);
++	EXPECT_EQ(U::minConfirmationsFor(0), 0u);
++
++	query.minConfirmations = 9;
++	EXPECT_FALSE(U::queryIsWellFormed(query));  // too shallow for Dogecoin
++	query.minConfirmations = 10;
++	EXPECT_TRUE(U::queryIsWellFormed(query));
++	query.minConfirmations = U::MAX_CONFIRMATIONS;
++	EXPECT_TRUE(U::queryIsWellFormed(query));
++	query.minConfirmations = U::MAX_CONFIRMATIONS + 1;
++	EXPECT_FALSE(U::queryIsWellFormed(query));
++	query.network = 0;
++	query.minConfirmations = 10;
++	EXPECT_FALSE(U::queryIsWellFormed(query));
++}
++
++TEST(UtxoTxReadOracle, ResultCodesAndReplyHelpers)
++{
++	using U = OI::UtxoTxRead;
++
++	EXPECT_EQ(U::RESULT_SUCCESS, 0u);
++	const QPI::uint64 failureCodes[] = {
++		U::RESULT_BAD_QUERY, U::RESULT_NETWORK_UNSUPPORTED, U::RESULT_TX_NOT_FOUND,
++		U::RESULT_NOT_CONFIRMED, U::RESULT_OUTPUT_OUT_OF_RANGE, U::RESULT_SCRIPT_TOO_LARGE,
++	};
++	const unsigned n = sizeof(failureCodes) / sizeof(failureCodes[0]);
++	for (unsigned i = 0; i < n; ++i)
++	{
++		EXPECT_NE(failureCodes[i], U::RESULT_SUCCESS);
++		for (unsigned j = i + 1; j < n; ++j)
++			EXPECT_NE(failureCodes[i], failureCodes[j]);
++	}
++
++	U::OracleReply reply{};
++	reply.code = U::RESULT_SUCCESS;
++	EXPECT_TRUE(U::replyIsValid(reply));
++	reply.code = U::RESULT_NOT_CONFIRMED;
++	EXPECT_FALSE(U::replyIsValid(reply));
++	EXPECT_TRUE(U::replyIsRetriable(reply));
++	reply.code = U::RESULT_TX_NOT_FOUND;
++	EXPECT_TRUE(U::replyIsRetriable(reply));
++	reply.code = U::RESULT_OUTPUT_OUT_OF_RANGE;
++	EXPECT_FALSE(U::replyIsRetriable(reply));
++}
++
++TEST(UtxoTxReadOracle, DeterministicQueryBytes)
++{
++	using U = OI::UtxoTxRead;
++
++	auto build = [](U::OracleQuery& q)
++	{
++		setMem(&q, sizeof(q), 0);
++		q.network = U::Network::dogecoin;
++		for (QPI::uint64 i = 0; i < 32; ++i)
++			q.txid.set(i, (QPI::uint8)(0x40 + i));
++		q.outputIndex = 1;
++		q.minConfirmations = 30;
++	};
++
++	U::OracleQuery a, b;
++	build(a);
++	build(b);
++	EXPECT_EQ(compareMem(&a, &b, sizeof(U::OracleQuery)), 0);
++}
++
++// END EvmCallRead / UtxoTxRead interface tests
+-- 
+2.43.0
+

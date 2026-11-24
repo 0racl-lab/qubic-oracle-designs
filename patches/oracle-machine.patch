@@ -1,0 +1,1844 @@
+From bae2918118b281200be06e0850ed1cbadf17eb0d Mon Sep 17 00:00:00 2001
+From: Oracl <oracl@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:09:24 +0000
+Subject: [PATCH] Add read_evm_call (interface 5) and read_utxo_tx (interface
+ 6) services
+
+read_evm_call: eth_call at a finalized block, pinned with EIP-1898, fixed
+sender and gas, multi-provider byte agreement; reuses EVM_RPC_URLS_<chainId>.
+read_utxo_tx: one output of a confirmed Dogecoin / Bitcoin / Litecoin tx via
+the nodes' shared JSON-RPC (txindex=1), exact Decimal amounts, depth checked
+on every node. Both stdlib-only Python with mock nodes and selftests (29 and
+33 checks). Node config, docker-compose and example_env register the slots.
+Requires the matching qubic/core interfaces (EvmCallRead.h, UtxoTxRead.h).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ docker/docker-compose.yml                     |  33 ++
+ example_env                                   |  19 +
+ libs/om_common/include/om_common/config.h     |   8 +
+ .../include/om_common/default_config.h        |   2 +
+ libs/om_common/src/config.cpp                 |  32 ++
+ oracles/CMakeLists.txt                        |   4 +
+ oracles/read_evm_call/CMakeLists.txt          |   4 +
+ oracles/read_evm_call/README.md               |  98 ++++++
+ .../read_evm_call/read_evm_call_service.py    | 328 ++++++++++++++++++
+ oracles/read_evm_call/test/live_check.py      |  56 +++
+ oracles/read_evm_call/test/mock_evm_rpc.py    | 123 +++++++
+ oracles/read_evm_call/test/selftest.py        | 152 ++++++++
+ oracles/read_utxo_tx/CMakeLists.txt           |   4 +
+ oracles/read_utxo_tx/README.md                | 113 ++++++
+ oracles/read_utxo_tx/read_utxo_tx_service.py  | 325 +++++++++++++++++
+ oracles/read_utxo_tx/test/live_check.py       |  49 +++
+ oracles/read_utxo_tx/test/mock_utxo_node.py   | 143 ++++++++
+ oracles/read_utxo_tx/test/selftest.py         | 150 ++++++++
+ 18 files changed, 1643 insertions(+)
+ create mode 100644 oracles/read_evm_call/CMakeLists.txt
+ create mode 100644 oracles/read_evm_call/README.md
+ create mode 100644 oracles/read_evm_call/read_evm_call_service.py
+ create mode 100755 oracles/read_evm_call/test/live_check.py
+ create mode 100755 oracles/read_evm_call/test/mock_evm_rpc.py
+ create mode 100755 oracles/read_evm_call/test/selftest.py
+ create mode 100644 oracles/read_utxo_tx/CMakeLists.txt
+ create mode 100644 oracles/read_utxo_tx/README.md
+ create mode 100644 oracles/read_utxo_tx/read_utxo_tx_service.py
+ create mode 100755 oracles/read_utxo_tx/test/live_check.py
+ create mode 100755 oracles/read_utxo_tx/test/mock_utxo_node.py
+ create mode 100755 oracles/read_utxo_tx/test/selftest.py
+
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index 73784f2..da287a3 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -66,6 +66,39 @@ services:
+     networks:
+       - oracle-net
+ 
++# Read EVM Call Oracle service
++  read-evm-call-service:
++    image: oracle-machine:latest
++    container_name: read-evm-call-service
++    volumes:
++      - ./logs:/opt/qubic/oracle-machine/logs
++    env_file:
++      - docker_local.env
++    user: "${HOST_UID}:${HOST_GID}"
++    # No published ports: the OM node reaches this service via the oracle-net service name.
++    restart: unless-stopped
++    command: ["read_evm_call_service", "--log","/opt/qubic/oracle-machine/logs/read_evm_call_service.log"]
++    networks:
++      - oracle-net
++
++# Read UTXO Tx Oracle service (Dogecoin / Bitcoin / Litecoin)
++  read-utxo-tx-service:
++    image: oracle-machine:latest
++    container_name: read-utxo-tx-service
++    volumes:
++      - ./logs:/opt/qubic/oracle-machine/logs
++    env_file:
++      - docker_local.env
++    user: "${HOST_UID}:${HOST_GID}"
++    # No published ports: the OM node reaches this service via the oracle-net service name.
++    # host-gateway makes the operator's own dogecoind / bitcoind on the host reachable as host.docker.internal.
++    extra_hosts:
++      - "host.docker.internal:host-gateway"
++    restart: unless-stopped
++    command: ["read_utxo_tx_service", "--log","/opt/qubic/oracle-machine/logs/read_utxo_tx_service.log"]
++    networks:
++      - oracle-net
++
+ # Network config
+ networks:
+   oracle-net:
+diff --git a/example_env b/example_env
+index a821535..74aff5f 100644
+--- a/example_env
++++ b/example_env
+@@ -57,6 +57,18 @@ export READ_EVM_LOG_SERVICE_PORT=31845
+ export READ_QUBIC_LOG_SERVICE_HOST=192.168.1.8
+ export READ_QUBIC_LOG_SERVICE_PORT=31847
+ 
++# read_evm_call Oracle Service (interface index 5): EVM contract state at a finalized block.
++# Python service: python3 oracles/read_evm_call/read_evm_call_service.py
++# Uses the same EVM_RPC_URLS_<chainId> / EVM_MIN_CONFIRMATIONS_<chainId> settings as read_evm_log
++# (endpoints must support eth_call with an EIP-1898 block hash).
++export READ_EVM_CALL_SERVICE_HOST=192.168.1.9
++export READ_EVM_CALL_SERVICE_PORT=31848
++
++# read_utxo_tx Oracle Service (interface index 6): one output of a confirmed Dogecoin / Bitcoin /
++# Litecoin transaction. Python service: python3 oracles/read_utxo_tx/read_utxo_tx_service.py
++export READ_UTXO_TX_SERVICE_HOST=192.168.1.10
++export READ_UTXO_TX_SERVICE_PORT=31849
++
+ # Bob node RPC URL(s) the service reads transaction receipts from, comma-separated. Run your OWN
+ # bob; all configured bobs must return byte-identical receipts or the service abstains.
+ # The URL must include the /qubic RPC path (bob answers JSON-RPC only at POST /qubic).
+@@ -73,6 +85,13 @@ export EVM_RPC_URLS_11155111=https://ethereum-sepolia-rpc.publicnode.com,https:/
+ # Optional per-chain finality override: (latest - N) instead of the "finalized" tag.
+ # export EVM_MIN_CONFIRMATIONS_56=30
+ 
++# UTXO chain nodes for read_utxo_tx, comma-separated, per network (DOGECOIN, BITCOIN, LITECOIN,
++# DOGECOIN_TESTNET, BITCOIN_TESTNET4, LITECOIN_TESTNET). Run your OWN nodes with txindex=1; use >= 2,
++# all must agree. Credentials in the URL are sent as HTTP basic auth (rpcuser / rpcpassword).
++export UTXO_RPC_URLS_DOGECOIN=http://rpcuser:rpcpassword@127.0.0.1:22555
++# export UTXO_RPC_URLS_BITCOIN=http://rpcuser:rpcpassword@127.0.0.1:8332
++# export UTXO_RPC_URLS_LITECOIN=http://rpcuser:rpcpassword@127.0.0.1:9332
++
+ # -----------------------------------------------------------------------------
+ # Exchange API Keys (optional - for higher rate limits)
+ # If not set, free tier with rate limiting will be used.
+diff --git a/libs/om_common/include/om_common/config.h b/libs/om_common/include/om_common/config.h
+index d8d6a06..d5bc475 100644
+--- a/libs/om_common/include/om_common/config.h
++++ b/libs/om_common/include/om_common/config.h
+@@ -13,6 +13,8 @@ constexpr const uint32_t MOCK_ORACLE_INTERFACE_INDEX = 1;
+ constexpr const uint32_t DOGE_ORACLE_INTERFACE_INDEX = 2;
+ constexpr const uint32_t READ_EVM_LOG_INTERFACE_INDEX = 3;
+ constexpr const uint32_t READ_QUBIC_LOG_INTERFACE_INDEX = 4;
++constexpr const uint32_t READ_EVM_CALL_INTERFACE_INDEX = 5;
++constexpr const uint32_t READ_UTXO_TX_INTERFACE_INDEX = 6;
+ constexpr const uint32_t MAX_ORACLE_INTERFACES_SUPPORT = 1024;
+ 
+ // ENVIRONMENT VARIABLE NAMES
+@@ -37,6 +39,12 @@ constexpr const char* READ_EVM_LOG_SERVICE_PORT = "READ_EVM_LOG_SERVICE_PORT";
+ 
+ constexpr const char* READ_QUBIC_LOG_SERVICE_HOST = "READ_QUBIC_LOG_SERVICE_HOST";
+ constexpr const char* READ_QUBIC_LOG_SERVICE_PORT = "READ_QUBIC_LOG_SERVICE_PORT";
++
++constexpr const char* READ_EVM_CALL_SERVICE_HOST = "READ_EVM_CALL_SERVICE_HOST";
++constexpr const char* READ_EVM_CALL_SERVICE_PORT = "READ_EVM_CALL_SERVICE_PORT";
++
++constexpr const char* READ_UTXO_TX_SERVICE_HOST = "READ_UTXO_TX_SERVICE_HOST";
++constexpr const char* READ_UTXO_TX_SERVICE_PORT = "READ_UTXO_TX_SERVICE_PORT";
+ } // namespace ConfigEnv
+ 
+ struct NodeEndpoint
+diff --git a/libs/om_common/include/om_common/default_config.h b/libs/om_common/include/om_common/default_config.h
+index d68a4ec..188826a 100644
+--- a/libs/om_common/include/om_common/default_config.h
++++ b/libs/om_common/include/om_common/default_config.h
+@@ -28,6 +28,8 @@ constexpr InterfaceDefault INTERFACES[] = {
+     {2, "Doge", "0.0.0.0", 9003},
+     {3, "ReadEvmLog", "0.0.0.0", 9005},
+     {4, "ReadQubicLog", "0.0.0.0", 9006},
++    {5, "ReadEvmCall", "0.0.0.0", 9007},
++    {6, "ReadUtxoTx", "0.0.0.0", 9008},
+     // Add more interfaces here
+ };
+ constexpr uint32_t INTERFACE_COUNT = sizeof(INTERFACES) / sizeof(INTERFACES[0]);
+diff --git a/libs/om_common/src/config.cpp b/libs/om_common/src/config.cpp
+index fc45377..ff05c2e 100644
+--- a/libs/om_common/src/config.cpp
++++ b/libs/om_common/src/config.cpp
+@@ -162,6 +162,38 @@ void Config::loadFromEnv()
+         _interfaces.push_back(interfaceEndpoint);
+     }
+ 
++    // Read EVM call interface (index 5) - EVM contract state at a finalized block
++    {
++        InterfaceEndpoint interfaceEndpoint;
++        interfaceEndpoint.interfaceIndex = READ_EVM_CALL_INTERFACE_INDEX;
++        interfaceEndpoint.interfaceName = "ReadEvmCall";
++        getStr(
++            ConfigEnv::READ_EVM_CALL_SERVICE_HOST,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].host,
++            interfaceEndpoint.serviceHost);
++        getUint16(
++            ConfigEnv::READ_EVM_CALL_SERVICE_PORT,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].port,
++            interfaceEndpoint.servicePort);
++        _interfaces.push_back(interfaceEndpoint);
++    }
++
++    // Read UTXO tx interface (index 6) - one output of a confirmed Dogecoin / Bitcoin / Litecoin tx
++    {
++        InterfaceEndpoint interfaceEndpoint;
++        interfaceEndpoint.interfaceIndex = READ_UTXO_TX_INTERFACE_INDEX;
++        interfaceEndpoint.interfaceName = "ReadUtxoTx";
++        getStr(
++            ConfigEnv::READ_UTXO_TX_SERVICE_HOST,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].host,
++            interfaceEndpoint.serviceHost);
++        getUint16(
++            ConfigEnv::READ_UTXO_TX_SERVICE_PORT,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].port,
++            interfaceEndpoint.servicePort);
++        _interfaces.push_back(interfaceEndpoint);
++    }
++
+     print();
+ 
+ }
+diff --git a/oracles/CMakeLists.txt b/oracles/CMakeLists.txt
+index 6c0274b..b0ceb9e 100644
+--- a/oracles/CMakeLists.txt
++++ b/oracles/CMakeLists.txt
+@@ -38,3 +38,7 @@ endif()
+ # read_evm_log is a Python service; its CMakeLists only installs the script into bin/
+ add_subdirectory(read_evm_log)
+ 
++# read_evm_call and read_utxo_tx are Python services; their CMakeLists only install the scripts into bin/
++add_subdirectory(read_evm_call)
++add_subdirectory(read_utxo_tx)
++
+diff --git a/oracles/read_evm_call/CMakeLists.txt b/oracles/read_evm_call/CMakeLists.txt
+new file mode 100644
+index 0000000..772cc83
+--- /dev/null
++++ b/oracles/read_evm_call/CMakeLists.txt
+@@ -0,0 +1,4 @@
++# Python service - nothing to build; install the script as an executable named like the others.
++install(PROGRAMS read_evm_call_service.py
++        DESTINATION bin
++        RENAME read_evm_call_service)
+diff --git a/oracles/read_evm_call/README.md b/oracles/read_evm_call/README.md
+new file mode 100644
+index 0000000..c880967
+--- /dev/null
++++ b/oracles/read_evm_call/README.md
+@@ -0,0 +1,98 @@
++# read_evm_call oracle service
++
++Generic **EVM state &rarr; Qubic** oracle. Given `(chainId, blockNumber, to, calldata)` it runs one
++read-only `eth_call` against that exact **finalized** block and returns the raw return data. Typical
++uses: `balanceOf`, `ownerOf`, `totalSupply`, reserve or price getters. No ABI is baked in: the
++querying Qubic smart contract encodes the call and decodes the result itself.
++
++It complements `read_evm_log`: that service proves something **happened** (an event), this one reads
++what something **is** at a fixed block.
++
++Implemented in Python (`read_evm_call_service.py`, stdlib only), with the same OM node <-> service
++framing and the same `EVM_RPC_URLS_<chainId>` configuration as `read_evm_log`.
++
++## Wire format
++
++Mirrors core's `OI::EvmCallRead` (`src/oracle_interfaces/EvmCallRead.h`, interface index 5).
++
++### Query — 568 bytes
++
++| offset | size | field         | notes                                                       |
++|-------:|-----:|---------------|-------------------------------------------------------------|
++| 0      | 8    | `chainId`     | uint64 LE                                                   |
++| 8      | 8    | `blockNumber` | uint64 LE; must be at or below the finalized head           |
++| 16     | 32   | `to`          | 20-byte address right-aligned; upper 12 bytes zero          |
++| 48     | 8    | `calldataLen` | uint64 LE, 4..512                                           |
++| 56     | 512  | `calldata`    | selector + ABI arguments; bytes beyond `calldataLen` zero   |
++
++### Reply — 568 bytes
++
++| offset | size | field       | notes                                                   |
++|-------:|-----:|-------------|---------------------------------------------------------|
++| 0      | 8    | `code`      | uint64 LE result code                                   |
++| 8      | 32   | `blockHash` | hash of the block that was read                         |
++| 40     | 8    | `reverted`  | 1 if the call reverted (data = revert data), else 0     |
++| 48     | 8    | `dataLen`   | 0..512                                                  |
++| 56     | 512  | `data`      | return or revert data, zero-padded                      |
++
++On any non-zero `code`, **all value fields are zero**.
++
++## Result codes
++
++| code | name                  | meaning                                                          |
++|-----:|-----------------------|------------------------------------------------------------------|
++| 0    | `SUCCESS`             | the call ran at the block; check `reverted`                      |
++| 1    | `BAD_QUERY`           | bad target word, `calldataLen` outside 4..512, dirty padding     |
++| 2    | `CHAIN_UNSUPPORTED`   | no RPC endpoints configured for `chainId`                        |
++| 3    | `BLOCK_NOT_FINALIZED` | block above the finalized head of some endpoint (retriable)      |
++| 4    | `BLOCK_TOO_OLD`       | more than 86,400 s before the finalized head (`STATE_WINDOW_SECONDS`) |
++| 5    | `OUT_OF_GAS`          | the call needed more than 10,000,000 gas                         |
++| 6    | `RETURN_TOO_LARGE`    | return or revert data over 512 bytes                             |
++
++A revert is a **result**, not a failure: `SUCCESS` with `reverted = 1` and the revert data. Other
++EVM execution failures (invalid opcode, bad jump, stack errors) are reported the same way with empty
++data. A transport error, an unrecognised node error or any provider disagreement is **not** a result
++code: the service abstains (oracle error flag, nothing committed).
++
++## Determinism guarantees
++
++- **Finalized only.** The block must be at or below the finalized head reported by *every*
++  endpoint (or `latest - EVM_MIN_CONFIRMATIONS_<chainId>` where configured).
++- **Pinned by hash.** The service resolves `blockNumber` to a block hash on every endpoint, requires
++  them to agree, then runs `eth_call` with an EIP-1898 block object
++  (`{"blockHash": ..., "requireCanonical": true}`), so all endpoints execute against the same state.
++- **Fixed call context.** Sender is the zero address, gas is exactly `GAS_CAP` (10,000,000), no
++  state overrides, no value.
++- **Multi-provider byte-agreement** on the block and on the normalized outcome
++  (return data / revert data / out of gas); otherwise abstain.
++- **State window, not archive nodes.** Endpoints need about a day of state, not full archive
++  history.
++
++## Config
++
++| env var                             | purpose                                                          |
++|-------------------------------------|------------------------------------------------------------------|
++| `READ_EVM_CALL_SERVICE_HOST/PORT`   | interface slot the OM node reaches this service on (default port 9007) |
++| `EVM_RPC_URLS_<chainId>`            | shared with `read_evm_log`; endpoints must support EIP-1898      |
++| `EVM_MIN_CONFIRMATIONS_<chainId>`   | optional; `latest - N` instead of the `finalized` tag            |
++
++Run: `python3 read_evm_call_service.py` (Python 3.8+, no third-party packages).
++
++## Tests
++
++```bash
++python3 test/mock_evm_rpc.py --port 18645 &
++python3 test/mock_evm_rpc.py --port 18646 &
++python3 test/mock_evm_rpc.py --port 18647 --tamper &
++python3 test/selftest.py     # exit 0 = all scenarios pass (29 checks)
++```
++
++The mock node only answers `eth_call` when the service sends the exact required context (zero
++sender, `GAS_CAP`, EIP-1898 hash pin), so the selftest also checks the call the service makes.
++
++Against real endpoints (nothing is sent to Qubic):
++
++```bash
++EVM_RPC_URLS_8453=https://base-rpc.publicnode.com,https://mainnet.base.org \
++python3 test/live_check.py 8453 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 0x<holder>
++```
+diff --git a/oracles/read_evm_call/read_evm_call_service.py b/oracles/read_evm_call/read_evm_call_service.py
+new file mode 100644
+index 0000000..884d533
+--- /dev/null
++++ b/oracles/read_evm_call/read_evm_call_service.py
+@@ -0,0 +1,328 @@
++#!/usr/bin/env python3
++"""read_evm_call oracle service (interface index 5): read EVM contract state at a finalized block.
++
++Query 568B: chainId u64 | blockNumber u64 | to 32B | calldataLen u64 | calldata 512B.
++Reply 568B: code u64 | blockHash 32B | reverted u64 | dataLen u64 | data 512B.
++Only finalized blocks are read; every configured RPC endpoint must agree byte-for-byte on the block
++and on the call's outcome, otherwise the service abstains (oracle error flag, no reply payload).
++
++Speaks the OM node <-> service protocol of oracles/core/base_oracle_service.cpp (same framing as
++read_evm_log):
++  query:  header 8B (size LE24 | type=190 | dejavu u32) | OracleMachineQuery 16B | payload 568B
++  reply:  header 8B (size LE24 | type=191 | dejavu=0)   | OracleMachineReply 16B | payload 568B
++
++Env: READ_EVM_CALL_SERVICE_PORT (default 9007), EVM_RPC_URLS_<chainId> (comma-separated; the same
++variables as read_evm_log), EVM_MIN_CONFIRMATIONS_<chainId> (optional: latest-N instead of the
++"finalized" tag).
++"""
++
++import json
++import os
++import signal
++import socket
++import socketserver
++import struct
++import sys
++import urllib.error
++import urllib.request
++
++QUERY_SIZE = 568
++REPLY_SIZE = 568
++DATA_CAPACITY = 512
++OM_QUERY_TYPE = 190
++OM_REPLY_TYPE = 191
++MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024
++RPC_TIMEOUT_S = 10
++SOCKET_TIMEOUT_S = 600  # mirrors core's BaseOracleService::TIME_OUT_MS
++MAX_FRAME_BYTES = 4096  # larger frame means corrupt framing, not an unrelated message
++
++# Mirrors core's OI::EvmCallRead
++GAS_CAP = 10_000_000
++STATE_WINDOW_SECONDS = 86_400
++ZERO_ADDRESS = "0x" + "00" * 20
++
++# Result codes (mirror core's OI::EvmCallRead)
++SUCCESS = 0
++BAD_QUERY = 1
++CHAIN_UNSUPPORTED = 2
++BLOCK_NOT_FINALIZED = 3
++BLOCK_TOO_OLD = 4
++OUT_OF_GAS = 5
++RETURN_TOO_LARGE = 6
++
++# Oracle error flags (mirror core's network_messages/common_def.h)
++NO_ERROR = 0x0
++ORACLE_UNAVAIL = 0x2
++INVALID_ARG = 0x10
++
++SUPPORTED_CHAIN_IDS = [1, 10, 56, 137, 250, 8453, 43114, 42161, 11155111]
++INTERFACE_INDEX = 5
++
++# EVM execution failures other than out-of-gas. They consume the call and return no data, so they
++# are reported like a revert with empty data. Messages are matched case-insensitively; any error not
++# recognised here makes the service abstain rather than guess.
++VM_FAILURE_MARKERS = (
++    "invalid opcode",
++    "invalid jump destination",
++    "stack underflow",
++    "stack overflow",
++    "write protection",
++    "return data out of bounds",
++)
++
++
++class Abstain(Exception):
++    """Transport error, malformed data or provider disagreement: commit nothing."""
++
++
++def hexb(s):
++    """0x-prefixed hex string -> bytes; raises on anything else."""
++    if not isinstance(s, str) or not s.startswith("0x") or len(s) % 2:
++        raise Abstain(f"expected 0x-prefixed even-length hex, got {s!r}")
++    try:
++        return bytes.fromhex(s[2:])
++    except ValueError as e:
++        raise Abstain(f"bad hex: {e}") from e
++
++
++def load_chains():
++    chains = {}
++    for chain_id in SUPPORTED_CHAIN_IDS:
++        urls = os.environ.get(f"EVM_RPC_URLS_{chain_id}", "")
++        endpoints = [u.strip() for u in urls.split(",") if u.strip()]
++        if not endpoints:
++            continue
++        conf = os.environ.get(f"EVM_MIN_CONFIRMATIONS_{chain_id}", "")
++        chains[chain_id] = {
++            "endpoints": endpoints,
++            "min_confirmations": max(0, int(conf)) if conf else 0,
++        }
++    return chains
++
++
++def rpc_raw(endpoint, method, params):
++    """One JSON-RPC call; returns the decoded reply object (with "result" or "error")."""
++    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
++    req = urllib.request.Request(endpoint, data=body, headers={"Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(req, timeout=RPC_TIMEOUT_S) as resp:
++            raw = resp.read(MAX_RPC_RESPONSE_BYTES + 1)
++    except urllib.error.HTTPError as e:  # some providers send JSON-RPC errors with HTTP 4xx/5xx
++        raw = e.read(MAX_RPC_RESPONSE_BYTES + 1)
++    except Exception as e:
++        raise Abstain(f"transport: {e}") from e
++    if len(raw) > MAX_RPC_RESPONSE_BYTES:
++        raise Abstain("response too large")
++    try:
++        reply = json.loads(raw)
++    except ValueError as e:
++        raise Abstain(f"bad json: {e}") from e
++    if not isinstance(reply, dict) or ("result" not in reply and "error" not in reply):
++        raise Abstain("not a JSON-RPC reply")
++    return reply
++
++
++def rpc(endpoint, method, params):
++    reply = rpc_raw(endpoint, method, params)
++    if "result" not in reply or reply.get("error"):
++        raise Abstain(f"rpc error: {reply.get('error')}")
++    return reply["result"]
++
++
++def block_info(block):
++    if not isinstance(block, dict):
++        raise Abstain("block not returned")
++    return int(block["number"], 16), hexb(block["hash"]), int(block["timestamp"], 16)
++
++
++def finalized_head(endpoint, chain):
++    """(number, timestamp) of the block this endpoint treats as final."""
++    if chain["min_confirmations"]:
++        latest = rpc(endpoint, "eth_getBlockByNumber", ["latest", False])
++        number = int(latest["number"], 16) - chain["min_confirmations"]
++        block = rpc(endpoint, "eth_getBlockByNumber", [hex(number), False])
++    else:
++        block = rpc(endpoint, "eth_getBlockByNumber", ["finalized", False])
++    number, _, timestamp = block_info(block)
++    return number, timestamp
++
++
++def call_outcome(endpoint, to20, calldata, block_hash):
++    """Normalized outcome of one eth_call pinned to block_hash (EIP-1898)."""
++    call = {"from": ZERO_ADDRESS, "to": "0x" + to20.hex(), "gas": hex(GAS_CAP), "data": "0x" + calldata.hex()}
++    reply = rpc_raw(endpoint, "eth_call", [call, {"blockHash": "0x" + block_hash.hex(), "requireCanonical": True}])
++    error = reply.get("error")
++    if not error:
++        return ("ok", hexb(reply["result"]))
++    if not isinstance(error, dict):
++        raise Abstain(f"malformed error: {error!r}")
++    message = str(error.get("message", "")).lower()
++    if error.get("code") == 3 or message.startswith("execution reverted"):
++        data = error.get("data")
++        return ("revert", hexb(data) if isinstance(data, str) and data else b"")
++    if "out of gas" in message:
++        return ("oog", b"")
++    if any(marker in message for marker in VM_FAILURE_MARKERS):
++        return ("revert", b"")
++    raise Abstain(f"unrecognised call error: {error}")
++
++
++def read_call(chain, block_number, to20, calldata):
++    """Returns (code, block_hash, outcome) agreed by every endpoint, or raises Abstain."""
++    agreed_block = None
++    outcome = None
++    too_old = False
++    for endpoint in chain["endpoints"]:
++        head_number, head_time = finalized_head(endpoint, chain)
++        if block_number > head_number:
++            return BLOCK_NOT_FINALIZED, None, None
++        block = block_info(rpc(endpoint, "eth_getBlockByNumber", [hex(block_number), False]))
++        if block[0] != block_number:
++            raise Abstain("endpoint returned a different block number")
++        if agreed_block is None:
++            agreed_block = block
++        elif block != agreed_block:
++            raise Abstain("provider disagreement on block")
++        if head_time - block[2] > STATE_WINDOW_SECONDS:
++            too_old = True
++    if too_old:
++        return BLOCK_TOO_OLD, None, None
++    for endpoint in chain["endpoints"]:
++        one = call_outcome(endpoint, to20, calldata, agreed_block[1])
++        if outcome is None:
++            outcome = one
++        elif one != outcome:
++            raise Abstain("provider disagreement on call result")
++    return SUCCESS, agreed_block[1], outcome
++
++
++def code_reply(code):
++    return struct.pack("<Q", code) + bytes(REPLY_SIZE - 8)
++
++
++def handle_query(chains, payload):
++    """568B query payload -> (errorFlags, 568B reply payload). Abstains via non-zero flags."""
++    if len(payload) != QUERY_SIZE:
++        return INVALID_ARG, bytes(REPLY_SIZE)
++    chain_id, block_number, to_word, calldata_len, calldata = struct.unpack("<QQ32sQ512s", payload)
++
++    if (to_word[:12] != bytes(12) or to_word[12:] == bytes(20)
++            or not 4 <= calldata_len <= 512 or calldata[calldata_len:] != bytes(512 - calldata_len)):
++        return NO_ERROR, code_reply(BAD_QUERY)
++    if chain_id not in chains:
++        return NO_ERROR, code_reply(CHAIN_UNSUPPORTED)
++
++    try:
++        code, block_hash, outcome = read_call(chains[chain_id], block_number, to_word[12:], calldata[:calldata_len])
++    except Exception as e:  # Abstain, or a malformed field (KeyError/ValueError) from a provider
++        print(f"[ReadEvmCall] abstain: {e}", file=sys.stderr)
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++    if code != SUCCESS:
++        return NO_ERROR, code_reply(code)
++    kind, data = outcome
++    if kind == "oog":
++        return NO_ERROR, code_reply(OUT_OF_GAS)
++    if len(data) > DATA_CAPACITY:
++        return NO_ERROR, code_reply(RETURN_TOO_LARGE)
++    if len(block_hash) != 32:
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++    reply = struct.pack("<Q", SUCCESS) + block_hash
++    reply += struct.pack("<QQ", 1 if kind == "revert" else 0, len(data))
++    reply += data + bytes(DATA_CAPACITY - len(data))
++    assert len(reply) == REPLY_SIZE
++    return NO_ERROR, reply
++
++
++def recv_exact(sock, n):
++    buf = b""
++    while len(buf) < n:
++        chunk = sock.recv(n - len(buf))
++        if not chunk:
++            return None
++        buf += chunk
++    return buf
++
++
++class Handler(socketserver.BaseRequestHandler):
++    def setup(self):
++        self.request.settimeout(SOCKET_TIMEOUT_S)
++
++    def handle(self):
++        try:
++            self.serve()
++        except socket.timeout:
++            return  # idle too long; the node reconnects
++
++    def serve(self):
++        while True:
++            header = recv_exact(self.request, 8)
++            if header is None:
++                return
++            size = header[0] | (header[1] << 8) | (header[2] << 16)
++            msg_type = header[3]
++            if size < 8 or size > MAX_FRAME_BYTES:
++                return  # corrupt framing: cannot resync, drop the connection
++            body = recv_exact(self.request, size - 8)
++            if body is None:
++                return
++            if msg_type != OM_QUERY_TYPE or len(body) != 16 + QUERY_SIZE:
++                continue  # skip unrelated frames
++            query_id, interface_index = struct.unpack("<QI", body[:12])
++            if interface_index != INTERFACE_INDEX:
++                continue  # not our interface (misrouted config)
++            try:
++                flags, reply_payload = handle_query(self.server.chains, body[16:])
++            except Exception as e:  # structural backstop: never kill the OM connection
++                print(f"[ReadEvmCall] abstain (unexpected): {e}", file=sys.stderr)
++                flags, reply_payload = ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++            reply_size = 8 + 16 + REPLY_SIZE
++            packet = bytes([reply_size & 0xFF, (reply_size >> 8) & 0xFF,
++                            (reply_size >> 16) & 0xFF, OM_REPLY_TYPE]) + bytes(4)
++            packet += struct.pack("<QH6x", query_id, flags)
++            packet += reply_payload
++            self.request.sendall(packet)
++
++
++class Server(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++def main():
++    args = sys.argv[1:]
++    if args[:1] == ["--log"] and len(args) == 2:
++        log = open(args[1], "a", buffering=1)
++        sys.stdout = sys.stderr = log
++    elif args:
++        print(f"usage: {sys.argv[0]} [--log FILE]")
++        return 0 if args[:1] == ["--help"] else 1
++
++    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    chains = load_chains()
++    if not chains:
++        print("No chains configured! Set EVM_RPC_URLS_<chainId>.", file=sys.stderr)
++        return 1
++    port = int(os.environ.get("READ_EVM_CALL_SERVICE_PORT", "9007"))
++    for chain_id, chain in chains.items():
++        finality = (f"{chain['min_confirmations']} confirmations"
++                    if chain["min_confirmations"] else '"finalized" tag')
++        print(f"[ReadEvmCall] chain {chain_id}: {len(chain['endpoints'])} endpoint(s), {finality}")
++    server = Server(("0.0.0.0", port), Handler)
++    server.chains = chains
++    print(f"[ReadEvmCall] listening on {port}")
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
++        print("[ReadEvmCall] shutdown")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_evm_call/test/live_check.py b/oracles/read_evm_call/test/live_check.py
+new file mode 100755
+index 0000000..233d20f
+--- /dev/null
++++ b/oracles/read_evm_call/test/live_check.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""Run one real EvmCallRead query through the service logic against live RPC endpoints.
++
++    EVM_RPC_URLS_8453=https://base-rpc.publicnode.com,https://mainnet.base.org \
++    python3 test/live_check.py 8453 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 0x<holder>
++
++Calls balanceOf(holder) on the token at the chain's current finalized block (or at --block N) and
++prints the decoded reply. Nothing is sent to Qubic.
++"""
++
++import argparse
++import os
++import struct
++import sys
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++import read_evm_call_service as svc
++
++NAMES = {0: "SUCCESS", 1: "BAD_QUERY", 2: "CHAIN_UNSUPPORTED", 3: "BLOCK_NOT_FINALIZED",
++         4: "BLOCK_TOO_OLD", 5: "OUT_OF_GAS", 6: "RETURN_TOO_LARGE"}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("chain", type=int)
++    p.add_argument("token")
++    p.add_argument("holder")
++    p.add_argument("--block", type=int, help="block number (default: the finalized head)")
++    a = p.parse_args()
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    chains = svc.load_chains()
++    if a.chain not in chains:
++        print(f"set EVM_RPC_URLS_{a.chain}")
++        return 1
++    block = a.block if a.block is not None else svc.finalized_head(chains[a.chain]["endpoints"][0], chains[a.chain])[0]
++    to = bytes.fromhex(a.token[2:].lower())
++    holder = bytes.fromhex(a.holder[2:].lower())
++    calldata = bytes.fromhex("70a08231") + bytes(12) + holder
++    payload = struct.pack("<QQ32sQ512s", a.chain, block, bytes(12) + to, len(calldata), calldata + bytes(512 - len(calldata)))
++    flags, r = svc.handle_query(chains, payload)
++    if flags:
++        print(f"abstained (flags {flags:#x}): see the message above")
++        return 2
++    code = struct.unpack("<Q", r[:8])[0]
++    print(f"block {block}: code {code} {NAMES.get(code, '?')}")
++    if code == 0:
++        n = struct.unpack("<Q", r[48:56])[0]
++        print(f"blockHash 0x{r[8:40].hex()}  reverted {r[40]}  dataLen {n}")
++        if n == 32:
++            print(f"balanceOf = {int.from_bytes(r[56:88], 'big')}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_evm_call/test/mock_evm_rpc.py b/oracles/read_evm_call/test/mock_evm_rpc.py
+new file mode 100755
+index 0000000..2d44da7
+--- /dev/null
++++ b/oracles/read_evm_call/test/mock_evm_rpc.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Minimal mock EVM JSON-RPC server for the read_evm_call oracle service selftest.
++
++Serves eth_getBlockByNumber and eth_call. eth_call is only answered when the service sends exactly
++what core's OI::EvmCallRead requires (zero sender, GAS_CAP gas, block pinned by hash per EIP-1898);
++anything else gets an "unrecognised" error, which makes the service abstain and the test fail.
++Run one instance per fake "provider"; --tamper changes one return value so provider-disagreement
++handling can be tested.
++
++Usage: mock_evm_rpc.py --port 18645 [--tamper]
++"""
++
++import argparse
++import json
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++GAS_CAP = hex(10_000_000)
++ZERO = "0x" + "00" * 20
++
++FINALIZED = 0x1FF
++FINALIZED_TIME = 0x64000000
++# blocks the mock knows: number -> (hash, timestamp)
++BLOCKS = {
++    0x100: ("0x" + "cc" * 32, FINALIZED_TIME - 3600),        # an hour before the finalized head
++    0x10: ("0x" + "c1" * 32, FINALIZED_TIME - 2 * 86400),    # two days before: outside the window
++    FINALIZED: ("0x" + "cf" * 32, FINALIZED_TIME),
++}
++LATEST = 0x210
++
++TOKEN = "0x" + "a0" * 20       # balanceOf -> 1,000,000
++REVERTER = "0x" + "a1" * 20    # reverts with Error(string) "nope"
++BURNER = "0x" + "a2" * 20      # runs out of gas
++BIG = "0x" + "a3" * 20         # returns 600 bytes
++BROKEN = "0x" + "a4" * 20      # node-specific failure the service doesn't recognise
++BADOP = "0x" + "a5" * 20       # hits an invalid opcode
++
++BALANCE_OF = "0x70a08231"
++# Error(string) "nope"
++REVERT_DATA = ("0x08c379a0" + "20".rjust(64, "0") + "4".rjust(64, "0") + "6e6f7065".ljust(64, "0"))
++
++
++def block(number):
++    h, t = BLOCKS[number]
++    return {"number": hex(number), "hash": h, "timestamp": hex(t), "parentHash": "0x" + "00" * 32}
++
++
++def eth_call(call, pin, tamper):
++    """Returns (result, error)."""
++    if call.get("from") != ZERO or call.get("gas") != GAS_CAP:
++        return None, {"code": -32602, "message": "unexpected call params (from/gas)"}
++    if not isinstance(pin, dict) or pin.get("requireCanonical") is not True:
++        return None, {"code": -32602, "message": "call not pinned by block hash"}
++    known = {h for h, _ in BLOCKS.values()}
++    if pin.get("blockHash") not in known:
++        return None, {"code": -32000, "message": "header not found"}
++    to, data = call.get("to"), call.get("data", "")
++    if to == TOKEN and data.startswith(BALANCE_OF):
++        value = 1_000_000 + (1 if tamper else 0)
++        return "0x" + format(value, "064x"), None
++    if to == REVERTER:
++        return None, {"code": 3, "message": "execution reverted: nope", "data": REVERT_DATA}
++    if to == BURNER:
++        return None, {"code": -32000, "message": "out of gas"}
++    if to == BIG:
++        return "0x" + "ab" * 600, None
++    if to == BADOP:
++        return None, {"code": -32000, "message": "invalid opcode: INVALID"}
++    if to == BROKEN:
++        return None, {"code": -32000, "message": "missing trie node 1234 (path )"}
++    return "0x", None  # an address with no code returns empty data
++
++
++class Handler(BaseHTTPRequestHandler):
++    tamper = False
++
++    def log_message(self, fmt, *args):  # quiet
++        pass
++
++    def do_POST(self):
++        length = int(self.headers.get("Content-Length", 0))
++        request = json.loads(self.rfile.read(length))
++        method = request.get("method")
++        params = request.get("params", [])
++        result, error = None, None
++
++        if method == "eth_getBlockByNumber":
++            tag = params[0]
++            if tag == "finalized":
++                result = block(FINALIZED)
++            elif tag == "latest":
++                result = {"number": hex(LATEST), "hash": "0x" + "ee" * 32, "timestamp": hex(FINALIZED_TIME + 60)}
++            else:
++                number = int(tag, 16)
++                result = block(number) if number in BLOCKS else None
++        elif method == "eth_call":
++            result, error = eth_call(params[0], params[1], self.tamper)
++        else:
++            error = {"code": -32601, "message": "method not found"}
++
++        reply = {"jsonrpc": "2.0", "id": request.get("id")}
++        if error:
++            reply["error"] = error
++        else:
++            reply["result"] = result
++        body = json.dumps(reply).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--port", type=int, required=True)
++    parser.add_argument("--tamper", action="store_true")
++    args = parser.parse_args()
++    Handler.tamper = args.tamper
++    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/oracles/read_evm_call/test/selftest.py b/oracles/read_evm_call/test/selftest.py
+new file mode 100755
+index 0000000..a9cb574
+--- /dev/null
++++ b/oracles/read_evm_call/test/selftest.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++"""Selftest for read_evm_call_service.py against mock_evm_rpc.py. Run:
++    python3 test/mock_evm_rpc.py --port 18645 &
++    python3 test/mock_evm_rpc.py --port 18646 &
++    python3 test/mock_evm_rpc.py --port 18647 --tamper &
++    python3 test/selftest.py           (exit 0 = all pass)
++"""
++
++import os
++import socket
++import struct
++import sys
++import threading
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++
++import read_evm_call_service as svc
++
++TOKEN = bytes.fromhex("a0" * 20)
++REVERTER = bytes.fromhex("a1" * 20)
++BURNER = bytes.fromhex("a2" * 20)
++BIG = bytes.fromhex("a3" * 20)
++BROKEN = bytes.fromhex("a4" * 20)
++BADOP = bytes.fromhex("a5" * 20)
++EOA = bytes.fromhex("e0" * 20)
++HOLDER = bytes.fromhex("bb" * 20)
++BALANCE_OF = bytes.fromhex("70a08231")
++BLOCK_HASH = bytes.fromhex("cc" * 32)
++
++failures = 0
++
++
++def check(cond, what):
++    global failures
++    print(f"  [{'PASS' if cond else 'FAIL'}] {what}")
++    if not cond:
++        failures += 1
++
++
++def query(chain_id, block, to20, calldata, to_word=None, length=None):
++    word = to_word if to_word is not None else bytes(12) + to20
++    n = len(calldata) if length is None else length
++    return struct.pack("<QQ32sQ512s", chain_id, block, word, n, calldata + bytes(512 - len(calldata)))
++
++
++def balance_of(holder):
++    return BALANCE_OF + bytes(12) + holder
++
++
++def code(r):
++    return struct.unpack("<Q", r[0:8])[0]
++
++
++def main():
++    os.environ["EVM_RPC_URLS_8453"] = "http://127.0.0.1:18645,http://127.0.0.1:18646"
++    chains = svc.load_chains()
++
++    print("SUCCESS (balanceOf at a finalized block):")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, TOKEN, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR, "service answers")
++    check(len(r) == 568, "reply is 568 bytes")
++    check(code(r) == svc.SUCCESS, "code == SUCCESS")
++    check(r[8:40] == BLOCK_HASH, "blockHash is the hash of the block read")
++    check(struct.unpack("<Q", r[40:48])[0] == 0, "reverted == 0")
++    check(struct.unpack("<Q", r[48:56])[0] == 32, "dataLen == 32")
++    check(r[56:88] == (1_000_000).to_bytes(32, "big"), "return data byte-exact (1,000,000)")
++    check(r[88:] == bytes(480), "data tail zero-padded")
++
++    print("Deterministic outcomes that are not failures:")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, REVERTER, bytes.fromhex("12345678")))
++    revert = bytes.fromhex("08c379a0") + (32).to_bytes(32, "big") + (4).to_bytes(32, "big") + b"nope" + bytes(28)
++    check(flags == svc.NO_ERROR and code(r) == svc.SUCCESS and struct.unpack("<Q", r[40:48])[0] == 1,
++          "revert: SUCCESS with reverted = 1")
++    check(struct.unpack("<Q", r[48:56])[0] == len(revert) and r[56:56 + len(revert)] == revert,
++          "revert data returned byte-exact (Error(string) 'nope')")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, BADOP, bytes.fromhex("12345678")))
++    check(flags == svc.NO_ERROR and code(r) == svc.SUCCESS and r[40] == 1 and r[48] == 0,
++          "invalid opcode: reverted = 1, no data")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, EOA, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR and code(r) == svc.SUCCESS and r[40] == 0 and r[48] == 0,
++          "address with no code: SUCCESS, empty data")
++
++    print("Result codes:")
++    flags, r = svc.handle_query(chains, query(8453, 0x300, TOKEN, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR and code(r) == svc.BLOCK_NOT_FINALIZED and r[8:] == bytes(560),
++          "block above finalized head: code 3, rest zero")
++    flags, r = svc.handle_query(chains, query(8453, 0x10, TOKEN, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR and code(r) == svc.BLOCK_TOO_OLD, "block outside the state window: code 4")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, BURNER, bytes.fromhex("12345678")))
++    check(flags == svc.NO_ERROR and code(r) == svc.OUT_OF_GAS, "out of gas: code 5")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, BIG, bytes.fromhex("12345678")))
++    check(flags == svc.NO_ERROR and code(r) == svc.RETURN_TOO_LARGE, "600-byte return: code 6")
++    flags, r = svc.handle_query(chains, query(1, 0x100, TOKEN, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR and code(r) == svc.CHAIN_UNSUPPORTED, "chain not configured: code 2")
++
++    print("Malformed queries (code 1):")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, TOKEN, balance_of(HOLDER), to_word=b"\x01" + bytes(11) + TOKEN))
++    check(code(r) == svc.BAD_QUERY, "dirty upper 12 bytes of target")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, bytes(20), balance_of(HOLDER)))
++    check(code(r) == svc.BAD_QUERY, "zero target address")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, TOKEN, BALANCE_OF[:3], length=3))
++    check(code(r) == svc.BAD_QUERY, "calldata shorter than a selector")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, TOKEN, balance_of(HOLDER), length=513))
++    check(code(r) == svc.BAD_QUERY, "calldataLen > 512")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, TOKEN, balance_of(HOLDER) + b"\x01", length=36))
++    check(code(r) == svc.BAD_QUERY, "non-zero byte after calldataLen")
++    flags, r = svc.handle_query(chains, b"\x00" * 100)
++    check(flags == svc.INVALID_ARG, "wrong payload size: INVALID_ARG flag")
++
++    print("Abstain (no reply payload committed):")
++    flags, r = svc.handle_query(chains, query(8453, 0x100, BROKEN, bytes.fromhex("12345678")))
++    check(flags != svc.NO_ERROR and r == bytes(568), "unrecognised node error")
++    os.environ["EVM_RPC_URLS_8453"] = "http://127.0.0.1:18645,http://127.0.0.1:18647"
++    flags, r = svc.handle_query(svc.load_chains(), query(8453, 0x100, TOKEN, balance_of(HOLDER)))
++    check(flags != svc.NO_ERROR, "tampered provider: disagreement")
++    os.environ["EVM_RPC_URLS_8453"] = "http://127.0.0.1:18645,http://127.0.0.1:1"
++    flags, r = svc.handle_query(svc.load_chains(), query(8453, 0x100, TOKEN, balance_of(HOLDER)))
++    check(flags != svc.NO_ERROR, "dead endpoint")
++
++    print("Confirmation-depth finality (EVM_MIN_CONFIRMATIONS_8453=0x10 -> head 0x200):")
++    os.environ["EVM_RPC_URLS_8453"] = "http://127.0.0.1:18645"
++    os.environ["EVM_MIN_CONFIRMATIONS_8453"] = str(0x210 - 0x1FF)
++    flags, r = svc.handle_query(svc.load_chains(), query(8453, 0x100, TOKEN, balance_of(HOLDER)))
++    check(flags == svc.NO_ERROR and code(r) == svc.SUCCESS, "latest - N head answers")
++    del os.environ["EVM_MIN_CONFIRMATIONS_8453"]
++
++    print("Wire protocol (OM node framing over TCP):")
++    os.environ["EVM_RPC_URLS_8453"] = "http://127.0.0.1:18645,http://127.0.0.1:18646"
++    server = svc.Server(("127.0.0.1", 0), svc.Handler)
++    server.chains = svc.load_chains()
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    payload = query(8453, 0x100, TOKEN, balance_of(HOLDER))
++    size = 8 + 16 + len(payload)
++    frame = bytes([size & 0xFF, (size >> 8) & 0xFF, size >> 16, svc.OM_QUERY_TYPE]) + bytes(4)
++    frame += struct.pack("<QII", 777, svc.INTERFACE_INDEX, 30000) + payload
++    with socket.create_connection(server.server_address, timeout=10) as s:
++        s.sendall(frame)
++        reply = svc.recv_exact(s, 8 + 16 + 568)
++    check(reply[3] == svc.OM_REPLY_TYPE and struct.unpack("<Q", reply[8:16])[0] == 777,
++          "reply frame carries type 191 and the query id")
++    check(struct.unpack("<H", reply[16:18])[0] == svc.NO_ERROR and reply[24:32] == bytes(8),
++          "no error flags, code SUCCESS")
++    server.shutdown()
++
++    print(f"{'SELFTEST FAILED' if failures else 'SELFTEST PASSED'} ({failures} failure(s))")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_utxo_tx/CMakeLists.txt b/oracles/read_utxo_tx/CMakeLists.txt
+new file mode 100644
+index 0000000..159e9de
+--- /dev/null
++++ b/oracles/read_utxo_tx/CMakeLists.txt
+@@ -0,0 +1,4 @@
++# Python service - nothing to build; install the script as an executable named like the others.
++install(PROGRAMS read_utxo_tx_service.py
++        DESTINATION bin
++        RENAME read_utxo_tx_service)
+diff --git a/oracles/read_utxo_tx/README.md b/oracles/read_utxo_tx/README.md
+new file mode 100644
+index 0000000..8d8faf7
+--- /dev/null
++++ b/oracles/read_utxo_tx/README.md
+@@ -0,0 +1,113 @@
++# read_utxo_tx oracle service
++
++Generic **Dogecoin / Bitcoin / Litecoin &rarr; Qubic** oracle. Given
++`(network, txid, outputIndex, minConfirmations)` it returns one output of a confirmed transaction —
++its value in base units and its raw `scriptPubKey` — plus the block it is in. No address formats are
++baked in: the querying Qubic smart contract compares the raw script with the one it expects (for
++example a seller's P2PKH script), or reads an `OP_RETURN` output's data itself.
++
++It is the UTXO sibling of `read_evm_log`, and lets a Qubic contract settle on a Dogecoin (or Bitcoin,
++or Litecoin) payment without a bridge.
++
++Implemented in Python (`read_utxo_tx_service.py`, stdlib only), with the same OM node <-> service
++framing as `read_evm_log`. It reads the chain's own node software over the standard JSON-RPC that
++dogecoind, bitcoind and litecoind share (`getrawtransaction`, `getblockheader`).
++
++## Wire format
++
++Mirrors core's `OI::UtxoTxRead` (`src/oracle_interfaces/UtxoTxRead.h`, interface index 6).
++
++### Query — 56 bytes
++
++| offset | size | field              | notes                                                      |
++|-------:|-----:|--------------------|------------------------------------------------------------|
++| 0      | 8    | `network`          | 1 Bitcoin, 2 Dogecoin, 3 Litecoin, 101/102/103 their testnets; 0 invalid |
++| 8      | 32   | `txid`             | display order, as explorers and the node RPC show it       |
++| 40     | 8    | `outputIndex`      | the `vout` to read                                          |
++| 48     | 8    | `minConfirmations` | network minimum (Bitcoin 3, Dogecoin 10, Litecoin 6, testnets 1) up to 1000 |
++
++### Reply — 208 bytes
++
++| offset | size | field         | notes                                                 |
++|-------:|-----:|---------------|-------------------------------------------------------|
++| 0      | 8    | `code`        | result code                                           |
++| 8      | 32   | `blockHash`   | display order                                         |
++| 40     | 8    | `blockHeight` |                                                       |
++| 48     | 8    | `blockTime`   | block header timestamp, Unix seconds                  |
++| 56     | 8    | `outputCount` | number of outputs in the transaction                  |
++| 64     | 8    | `value`       | base units: 1 DOGE = 100,000,000 koinu                |
++| 72     | 8    | `scriptLen`   | 0..128                                                |
++| 80     | 128  | `script`      | raw `scriptPubKey`, zero-padded                       |
++
++On any non-zero `code`, **all value fields are zero**.
++
++## Result codes
++
++| code | name                  | meaning                                                         |
++|-----:|-----------------------|-----------------------------------------------------------------|
++| 0    | `SUCCESS`             | output returned                                                 |
++| 1    | `BAD_QUERY`           | zero txid, or `minConfirmations` outside the network's range    |
++| 2    | `NETWORK_UNSUPPORTED` | unknown network, or no nodes configured for it                  |
++| 3    | `TX_NOT_FOUND`        | no node knows the transaction (retriable)                       |
++| 4    | `NOT_CONFIRMED`       | in the mempool, reorganised away, or too shallow on some node (retriable) |
++| 5    | `OUTPUT_OUT_OF_RANGE` | `outputIndex >= outputCount`                                    |
++| 6    | `SCRIPT_TOO_LARGE`    | script longer than 128 bytes                                    |
++
++A transport error, wrong credentials, an amount that isn't an exact number of base units, or any
++disagreement between nodes is **not** a result code: the service abstains (oracle error flag,
++nothing committed).
++
++## Determinism guarantees
++
++- **Deep enough on every node.** The containing block must have at least `minConfirmations`
++  confirmations on *every* configured node; a node a few blocks behind turns the answer into
++  `NOT_CONFIRMED` rather than a split.
++- **Main chain only.** A block whose header reports `confirmations < 1` (reorganised away) never
++  counts.
++- **Byte-agreement** across nodes on the outputs (value and script) and on the block (hash, height,
++  time); otherwise abstain.
++- **Exact amounts.** Node JSON is parsed with `Decimal`, never `float`; amounts are converted to base
++  units only if exact.
++- **Spent status is deliberately not reported**: it changes over time and would break agreement.
++
++## Running nodes
++
++Each operator should run their **own** nodes with `txindex=1` (needed to look up any confirmed
++transaction by id). Dogecoin Core example (`dogecoin.conf`):
++
++```
++server=1
++txindex=1
++rpcuser=...
++rpcpassword=...
++rpcallowip=127.0.0.1
++```
++
++## Config
++
++| env var                            | purpose                                                         |
++|------------------------------------|-----------------------------------------------------------------|
++| `READ_UTXO_TX_SERVICE_HOST/PORT`   | interface slot the OM node reaches this service on (default port 9008) |
++| `UTXO_RPC_URLS_<NETWORK>`          | comma-separated node URLs; `NETWORK` is `DOGECOIN`, `BITCOIN`, `LITECOIN`, `DOGECOIN_TESTNET`, `BITCOIN_TESTNET4` or `LITECOIN_TESTNET`. `http://user:pass@host:port` credentials are sent as basic auth |
++
++Run: `python3 read_utxo_tx_service.py` (Python 3.8+, no third-party packages).
++
++## Tests
++
++```bash
++python3 test/mock_utxo_node.py --port 18745 &
++python3 test/mock_utxo_node.py --port 18746 &
++python3 test/mock_utxo_node.py --port 18747 --tamper &
++python3 test/mock_utxo_node.py --port 18748 --lag 45 &
++python3 test/selftest.py     # exit 0 = all scenarios pass (33 checks)
++```
++
++The mock node behaves like Dogecoin Core: basic auth, JSON-RPC errors over HTTP 500, error `-5` for
++unknown transactions, amounts printed as 8-decimal JSON numbers.
++
++Against your own node (nothing is sent to Qubic):
++
++```bash
++UTXO_RPC_URLS_DOGECOIN=http://user:pass@127.0.0.1:22555 \
++python3 test/live_check.py dogecoin <txid> <vout> --confirmations 10
++```
+diff --git a/oracles/read_utxo_tx/read_utxo_tx_service.py b/oracles/read_utxo_tx/read_utxo_tx_service.py
+new file mode 100644
+index 0000000..3c1b07b
+--- /dev/null
++++ b/oracles/read_utxo_tx/read_utxo_tx_service.py
+@@ -0,0 +1,325 @@
++#!/usr/bin/env python3
++"""read_utxo_tx oracle service (interface index 6): one output of a confirmed Dogecoin / Bitcoin /
++Litecoin transaction.
++
++Query 56B:  network u64 | txid 32B (display order) | outputIndex u64 | minConfirmations u64.
++Reply 208B: code u64 | blockHash 32B | blockHeight u64 | blockTime u64 | outputCount u64 |
++            value u64 (base units) | scriptLen u64 | script 128B.
++Only transactions buried under at least minConfirmations blocks on EVERY configured node are
++answered; all nodes must agree byte-for-byte on the transaction's block and outputs, otherwise the
++service abstains (oracle error flag, no reply payload).
++
++The service reads the chain's own node software over its standard JSON-RPC
++(getrawtransaction / getblockheader), which dogecoind, bitcoind and litecoind share. Nodes must run
++with txindex=1 so any confirmed transaction can be looked up by id.
++
++Speaks the OM node <-> service protocol of oracles/core/base_oracle_service.cpp (same framing as
++read_evm_log):
++  query:  header 8B (size LE24 | type=190 | dejavu u32) | OracleMachineQuery 16B | payload 56B
++  reply:  header 8B (size LE24 | type=191 | dejavu=0)   | OracleMachineReply 16B | payload 208B
++
++Env: READ_UTXO_TX_SERVICE_PORT (default 9008),
++     UTXO_RPC_URLS_<NETWORK> comma-separated node URLs, e.g.
++       UTXO_RPC_URLS_DOGECOIN=http://user:pass@127.0.0.1:22555,http://user:pass@10.0.0.5:22555
++     with NETWORK one of DOGECOIN, BITCOIN, LITECOIN, DOGECOIN_TESTNET, BITCOIN_TESTNET4,
++     LITECOIN_TESTNET. Credentials in the URL are sent as HTTP basic auth.
++"""
++
++import base64
++import json
++import os
++import signal
++import socket
++import socketserver
++import struct
++import sys
++import urllib.error
++import urllib.parse
++import urllib.request
++from decimal import Decimal, InvalidOperation
++
++QUERY_SIZE = 56
++REPLY_SIZE = 208
++SCRIPT_CAPACITY = 128
++OM_QUERY_TYPE = 190
++OM_REPLY_TYPE = 191
++MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024
++RPC_TIMEOUT_S = 10
++SOCKET_TIMEOUT_S = 600  # mirrors core's BaseOracleService::TIME_OUT_MS
++MAX_FRAME_BYTES = 4096  # larger frame means corrupt framing, not an unrelated message
++
++# Result codes (mirror core's OI::UtxoTxRead)
++SUCCESS = 0
++BAD_QUERY = 1
++NETWORK_UNSUPPORTED = 2
++TX_NOT_FOUND = 3
++NOT_CONFIRMED = 4
++OUTPUT_OUT_OF_RANGE = 5
++SCRIPT_TOO_LARGE = 6
++
++# Oracle error flags (mirror core's network_messages/common_def.h)
++NO_ERROR = 0x0
++ORACLE_UNAVAIL = 0x2
++INVALID_ARG = 0x10
++
++INTERFACE_INDEX = 6
++
++# Mirrors OI::UtxoTxRead::Network and minConfirmationsFor(): id -> (env name, minimum depth)
++NETWORKS = {
++    1: ("BITCOIN", 3),
++    2: ("DOGECOIN", 10),
++    3: ("LITECOIN", 6),
++    101: ("BITCOIN_TESTNET4", 1),
++    102: ("DOGECOIN_TESTNET", 1),
++    103: ("LITECOIN_TESTNET", 1),
++}
++MAX_CONFIRMATIONS = 1000
++
++COIN = Decimal(100_000_000)        # base units per coin on all three chains (koinu, satoshi, litoshi)
++MAX_U64 = (1 << 64) - 1
++RPC_INVALID_ADDRESS_OR_KEY = -5    # "No such mempool or blockchain transaction"
++
++
++class Abstain(Exception):
++    """Transport error, malformed data or node disagreement: commit nothing."""
++
++
++class Node:
++    """One JSON-RPC endpoint; credentials in the URL become an Authorization header."""
++
++    def __init__(self, url):
++        parts = urllib.parse.urlsplit(url)
++        self.auth = None
++        if parts.username is not None:
++            user = urllib.parse.unquote(parts.username)
++            password = urllib.parse.unquote(parts.password or "")
++            self.auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
++            netloc = parts.hostname + (f":{parts.port}" if parts.port else "")
++            url = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
++        self.url = url
++
++    def call(self, method, params):
++        """Returns (result, error) of one JSON-RPC 1.0 call. Raises Abstain on transport failure."""
++        body = json.dumps({"jsonrpc": "1.0", "id": "qubic-om", "method": method, "params": params}).encode()
++        headers = {"Content-Type": "application/json"}
++        if self.auth:
++            headers["Authorization"] = self.auth
++        req = urllib.request.Request(self.url, data=body, headers=headers)
++        try:
++            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT_S) as resp:
++                raw = resp.read(MAX_RPC_RESPONSE_BYTES + 1)
++        except urllib.error.HTTPError as e:  # bitcoind-family nodes answer RPC errors with HTTP 404/500
++            if e.code in (401, 403):
++                raise Abstain(f"node refused credentials (HTTP {e.code})") from e
++            raw = e.read(MAX_RPC_RESPONSE_BYTES + 1)
++        except Exception as e:
++            raise Abstain(f"transport: {e}") from e
++        if len(raw) > MAX_RPC_RESPONSE_BYTES:
++            raise Abstain("response too large")
++        try:
++            reply = json.loads(raw, parse_float=Decimal)  # amounts must never pass through float
++        except ValueError as e:
++            raise Abstain(f"bad json: {e}") from e
++        if not isinstance(reply, dict) or ("result" not in reply and "error" not in reply):
++            raise Abstain("not a JSON-RPC reply")
++        return reply.get("result"), reply.get("error")
++
++
++def load_networks():
++    networks = {}
++    for network_id, (name, min_conf) in NETWORKS.items():
++        urls = os.environ.get(f"UTXO_RPC_URLS_{name}", "")
++        nodes = [Node(u.strip()) for u in urls.split(",") if u.strip()]
++        if nodes:
++            networks[network_id] = {"name": name, "min_confirmations": min_conf, "nodes": nodes}
++    return networks
++
++
++def base_units(value):
++    """Exact coin amount (Decimal) -> integer base units; raises on anything not exact."""
++    if not isinstance(value, (Decimal, int)) or isinstance(value, bool):
++        raise Abstain(f"amount is not a number: {value!r}")
++    units = Decimal(value) * COIN
++    if units != units.to_integral_value() or units < 0 or units > MAX_U64:
++        raise Abstain(f"amount not representable in base units: {value}")
++    return int(units)
++
++
++def read_on_node(node, txid_hex):
++    """What one node says about the transaction: None (unknown), or a dict with its outputs and,
++    if it is in a block on the node's main chain, the block and confirmation count."""
++    tx, error = node.call("getrawtransaction", [txid_hex, 1])
++    if error:
++        if isinstance(error, dict) and error.get("code") == RPC_INVALID_ADDRESS_OR_KEY:
++            return None
++        raise Abstain(f"getrawtransaction error: {error}")
++    if not isinstance(tx, dict) or tx.get("txid") != txid_hex:
++        raise Abstain("node returned a different transaction")
++    outputs = []
++    for i, out in enumerate(tx["vout"]):
++        if out.get("n") != i:
++            raise Abstain("outputs not in order")
++        outputs.append((base_units(out["value"]), bytes.fromhex(out["scriptPubKey"]["hex"])))
++    seen = {"outputs": outputs, "block": None, "confirmations": 0}
++    block_hash = tx.get("blockhash")
++    if not block_hash:
++        return seen  # in the mempool
++    header, error = node.call("getblockheader", [block_hash, True])
++    if error or not isinstance(header, dict) or header.get("hash") != block_hash:
++        raise Abstain(f"getblockheader failed: {error}")
++    confirmations = int(header["confirmations"])
++    if confirmations < 1:
++        return seen  # block no longer on this node's main chain (reorganised away)
++    seen["block"] = (bytes.fromhex(block_hash), int(header["height"]), int(header["time"]))
++    seen["confirmations"] = confirmations
++    return seen
++
++
++def read_tx(network, txid_hex, min_conf):
++    """(code, facts) agreed by every node, or raises Abstain."""
++    views = [read_on_node(node, txid_hex) for node in network["nodes"]]
++    if all(v is None for v in views):
++        return TX_NOT_FOUND, None
++    if any(v is None for v in views):
++        raise Abstain("nodes disagree on whether the transaction exists")
++    if any(v["outputs"] != views[0]["outputs"] for v in views):
++        raise Abstain("nodes disagree on the transaction's outputs")
++    if any(v["block"] is None or v["confirmations"] < min_conf for v in views):
++        return NOT_CONFIRMED, None
++    if any(v["block"] != views[0]["block"] for v in views):
++        raise Abstain("nodes disagree on the containing block")
++    return SUCCESS, views[0]
++
++
++def code_reply(code):
++    return struct.pack("<Q", code) + bytes(REPLY_SIZE - 8)
++
++
++def handle_query(networks, payload):
++    """56B query payload -> (errorFlags, 208B reply payload). Abstains via non-zero flags."""
++    if len(payload) != QUERY_SIZE:
++        return INVALID_ARG, bytes(REPLY_SIZE)
++    network_id, txid, output_index, min_conf = struct.unpack("<Q32sQQ", payload)
++
++    if network_id not in NETWORKS:
++        return NO_ERROR, code_reply(NETWORK_UNSUPPORTED)
++    if txid == bytes(32) or not NETWORKS[network_id][1] <= min_conf <= MAX_CONFIRMATIONS:
++        return NO_ERROR, code_reply(BAD_QUERY)
++    if network_id not in networks:
++        return NO_ERROR, code_reply(NETWORK_UNSUPPORTED)
++
++    try:
++        code, facts = read_tx(networks[network_id], txid.hex(), min_conf)
++    except Exception as e:  # Abstain, or a malformed field (KeyError/ValueError) from a node
++        print(f"[ReadUtxoTx] abstain: {e}", file=sys.stderr)
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++    if code != SUCCESS:
++        return NO_ERROR, code_reply(code)
++    outputs = facts["outputs"]
++    if output_index >= len(outputs):
++        return NO_ERROR, code_reply(OUTPUT_OUT_OF_RANGE)
++    value, script = outputs[output_index]
++    if len(script) > SCRIPT_CAPACITY:
++        return NO_ERROR, code_reply(SCRIPT_TOO_LARGE)
++    block_hash, height, block_time = facts["block"]
++    if len(block_hash) != 32:
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++    reply = struct.pack("<Q", SUCCESS) + block_hash
++    reply += struct.pack("<QQQQQ", height, block_time, len(outputs), value, len(script))
++    reply += script + bytes(SCRIPT_CAPACITY - len(script))
++    assert len(reply) == REPLY_SIZE
++    return NO_ERROR, reply
++
++
++def recv_exact(sock, n):
++    buf = b""
++    while len(buf) < n:
++        chunk = sock.recv(n - len(buf))
++        if not chunk:
++            return None
++        buf += chunk
++    return buf
++
++
++class Handler(socketserver.BaseRequestHandler):
++    def setup(self):
++        self.request.settimeout(SOCKET_TIMEOUT_S)
++
++    def handle(self):
++        try:
++            self.serve()
++        except socket.timeout:
++            return  # idle too long; the node reconnects
++
++    def serve(self):
++        while True:
++            header = recv_exact(self.request, 8)
++            if header is None:
++                return
++            size = header[0] | (header[1] << 8) | (header[2] << 16)
++            msg_type = header[3]
++            if size < 8 or size > MAX_FRAME_BYTES:
++                return  # corrupt framing: cannot resync, drop the connection
++            body = recv_exact(self.request, size - 8)
++            if body is None:
++                return
++            if msg_type != OM_QUERY_TYPE or len(body) != 16 + QUERY_SIZE:
++                continue  # skip unrelated frames
++            query_id, interface_index = struct.unpack("<QI", body[:12])
++            if interface_index != INTERFACE_INDEX:
++                continue  # not our interface (misrouted config)
++            try:
++                flags, reply_payload = handle_query(self.server.networks, body[16:])
++            except Exception as e:  # structural backstop: never kill the OM connection
++                print(f"[ReadUtxoTx] abstain (unexpected): {e}", file=sys.stderr)
++                flags, reply_payload = ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++            reply_size = 8 + 16 + REPLY_SIZE
++            packet = bytes([reply_size & 0xFF, (reply_size >> 8) & 0xFF,
++                            (reply_size >> 16) & 0xFF, OM_REPLY_TYPE]) + bytes(4)
++            packet += struct.pack("<QH6x", query_id, flags)
++            packet += reply_payload
++            self.request.sendall(packet)
++
++
++class Server(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++def main():
++    args = sys.argv[1:]
++    if args[:1] == ["--log"] and len(args) == 2:
++        log = open(args[1], "a", buffering=1)
++        sys.stdout = sys.stderr = log
++    elif args:
++        print(f"usage: {sys.argv[0]} [--log FILE]")
++        return 0 if args[:1] == ["--help"] else 1
++
++    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    networks = load_networks()
++    if not networks:
++        print("No networks configured! Set UTXO_RPC_URLS_<NETWORK>, e.g. UTXO_RPC_URLS_DOGECOIN.", file=sys.stderr)
++        return 1
++    port = int(os.environ.get("READ_UTXO_TX_SERVICE_PORT", "9008"))
++    for network in networks.values():
++        print(f"[ReadUtxoTx] {network['name']}: {len(network['nodes'])} node(s), "
++              f"minimum {network['min_confirmations']} confirmations")
++    server = Server(("0.0.0.0", port), Handler)
++    server.networks = networks
++    print(f"[ReadUtxoTx] listening on {port}")
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
++        print("[ReadUtxoTx] shutdown")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_utxo_tx/test/live_check.py b/oracles/read_utxo_tx/test/live_check.py
+new file mode 100755
+index 0000000..2ab6116
+--- /dev/null
++++ b/oracles/read_utxo_tx/test/live_check.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Run one real UtxoTxRead query through the service logic against your own node(s).
++
++    UTXO_RPC_URLS_DOGECOIN=http://user:pass@127.0.0.1:22555 \
++    python3 test/live_check.py dogecoin <txid> <vout> [--confirmations 10]
++
++Prints the decoded reply. Nothing is sent to Qubic.
++"""
++
++import argparse
++import os
++import struct
++import sys
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++import read_utxo_tx_service as svc
++
++IDS = {name.lower(): network_id for network_id, (name, _) in svc.NETWORKS.items()}
++NAMES = {0: "SUCCESS", 1: "BAD_QUERY", 2: "NETWORK_UNSUPPORTED", 3: "TX_NOT_FOUND",
++         4: "NOT_CONFIRMED", 5: "OUTPUT_OUT_OF_RANGE", 6: "SCRIPT_TOO_LARGE"}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("network", choices=sorted(IDS))
++    p.add_argument("txid")
++    p.add_argument("vout", type=int)
++    p.add_argument("--confirmations", type=int, help="default: the network's minimum")
++    a = p.parse_args()
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    network = IDS[a.network]
++    min_conf = a.confirmations or svc.NETWORKS[network][1]
++    payload = struct.pack("<Q32sQQ", network, bytes.fromhex(a.txid), a.vout, min_conf)
++    flags, r = svc.handle_query(svc.load_networks(), payload)
++    if flags:
++        print(f"abstained (flags {flags:#x}): see the message above")
++        return 2
++    code = struct.unpack("<Q", r[:8])[0]
++    print(f"code {code} {NAMES.get(code, '?')}")
++    if code == 0:
++        height, time, count, value, slen = struct.unpack("<QQQQQ", r[40:80])
++        print(f"block {r[8:40].hex()} height {height} time {time}")
++        print(f"output {a.vout} of {count}: {value} base units ({value / 1e8:.8f} coins), script {r[80:80 + slen].hex()}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_utxo_tx/test/mock_utxo_node.py b/oracles/read_utxo_tx/test/mock_utxo_node.py
+new file mode 100755
+index 0000000..e0ba594
+--- /dev/null
++++ b/oracles/read_utxo_tx/test/mock_utxo_node.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Minimal mock dogecoind / bitcoind JSON-RPC node for the read_utxo_tx oracle service selftest.
++
++Answers getrawtransaction (verbose) and getblockheader the way Dogecoin Core / Bitcoin Core do,
++including JSON-RPC errors sent with HTTP 500 and HTTP basic auth (user "qubic", password "om").
++Amounts are written as JSON decimals with 8 places, exactly as the node prints them.
++
++--tamper   changes one output by 1 koinu (provider disagreement)
++--lag N    reports every confirmation count N lower (a node a few blocks behind)
++
++Usage: mock_utxo_node.py --port 18745 [--tamper] [--lag 3]
++"""
++
++import argparse
++import base64
++import json
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++AUTH = "Basic " + base64.b64encode(b"qubic:om").decode()
++
++TIP = 5_400_000
++BLOCK_A = "a1" * 32    # buried: 50 confirmations
++BLOCK_S = "a2" * 32    # shallow: 5 confirmations
++BLOCK_O = "a3" * 32    # reorganised away: confirmations -1
++HEADERS = {
++    BLOCK_A: {"height": TIP - 49, "time": 1764000000},
++    BLOCK_S: {"height": TIP - 4, "time": 1764002700},
++    BLOCK_O: {"height": TIP - 20, "time": 1764001500, "orphan": True},
++}
++
++# Dogecoin P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
++P2PKH_SELLER = "76a914" + "5e" * 20 + "88ac"
++P2PKH_CHANGE = "76a914" + "c4" * 20 + "88ac"
++# OP_RETURN carrying a 32-byte trade reference
++OP_RETURN_REF = "6a20" + "7a" * 32
++BIG_SCRIPT = "51" * 200  # a 200-byte script (non-standard, but valid in a block)
++
++TXID_A = "d0" * 31 + "01"   # confirmed, 3 outputs
++TXID_M = "d0" * 31 + "02"   # mempool
++TXID_S = "d0" * 31 + "03"   # shallow
++TXID_O = "d0" * 31 + "04"   # in an orphaned block
++TXID_B = "d0" * 31 + "05"   # confirmed, oversized script
++TXID_F = "d0" * 31 + "06"   # confirmed, amount with 9 decimals (impossible: node bug)
++
++
++def amount(text):
++    return {"__raw__": text}
++
++
++def tx(txid, outputs, block=None, tamper=False):
++    vout = []
++    for n, (value, script) in enumerate(outputs):
++        if tamper and n == 0:
++            value = value[:-1] + str((int(value[-1]) + 1) % 10)
++        vout.append({"value": amount(value), "n": n, "scriptPubKey": {"hex": script, "type": "x"}})
++    out = {"txid": txid, "hash": txid, "version": 1, "vin": [], "vout": vout}
++    if block:
++        out["blockhash"] = block
++    return out
++
++
++def transactions(tamper):
++    return {
++        TXID_A: tx(TXID_A, [("1234.56789012", P2PKH_SELLER), ("0.00000000", OP_RETURN_REF),
++                            ("98765.43210000", P2PKH_CHANGE)], BLOCK_A, tamper),
++        TXID_M: tx(TXID_M, [("10.00000000", P2PKH_SELLER)]),
++        TXID_S: tx(TXID_S, [("10.00000000", P2PKH_SELLER)], BLOCK_S),
++        TXID_O: tx(TXID_O, [("10.00000000", P2PKH_SELLER)], BLOCK_O),
++        TXID_B: tx(TXID_B, [("1.00000000", BIG_SCRIPT)], BLOCK_A),
++        TXID_F: tx(TXID_F, [("1.000000001", P2PKH_SELLER)], BLOCK_A),
++    }
++
++
++def encode(obj):
++    """JSON with raw decimal amounts (so 0.1 stays 0.1, as the node prints it)."""
++    text, out, marker = json.dumps(obj), [], '{"__raw__": "'
++    while marker in text:
++        before, rest = text.split(marker, 1)
++        number, text = rest.split('"}', 1)
++        out.append(before + number)
++    out.append(text)
++    return "".join(out)
++
++
++class Handler(BaseHTTPRequestHandler):
++    tamper = False
++    lag = 0
++
++    def log_message(self, fmt, *args):  # quiet
++        pass
++
++    def reply(self, status, obj):
++        body = encode(obj).encode()
++        self.send_response(status)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def do_POST(self):
++        if self.headers.get("Authorization") != AUTH:
++            self.send_response(401)
++            self.end_headers()
++            return
++        length = int(self.headers.get("Content-Length", 0))
++        request = json.loads(self.rfile.read(length))
++        method, params, rid = request.get("method"), request.get("params", []), request.get("id")
++
++        if method == "getrawtransaction":
++            found = transactions(self.tamper).get(params[0])
++            if params[1:] != [1]:
++                return self.reply(500, {"result": None, "error": {"code": -8, "message": "expected verbose=1"}, "id": rid})
++            if found is None:
++                return self.reply(500, {"result": None, "error": {
++                    "code": -5, "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."}, "id": rid})
++            if "blockhash" in found:
++                h = HEADERS[found["blockhash"]]
++                found["confirmations"] = -1 if h.get("orphan") else TIP - h["height"] + 1 - self.lag
++            return self.reply(200, {"result": found, "error": None, "id": rid})
++
++        if method == "getblockheader":
++            h = HEADERS.get(params[0])
++            if h is None:
++                return self.reply(500, {"result": None, "error": {"code": -5, "message": "Block not found"}, "id": rid})
++            confirmations = -1 if h.get("orphan") else TIP - h["height"] + 1 - self.lag
++            return self.reply(200, {"result": {"hash": params[0], "confirmations": confirmations, "height": h["height"],
++                                               "time": h["time"], "version": 6422788}, "error": None, "id": rid})
++
++        return self.reply(500, {"result": None, "error": {"code": -32601, "message": "Method not found"}, "id": rid})
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--port", type=int, required=True)
++    parser.add_argument("--tamper", action="store_true")
++    parser.add_argument("--lag", type=int, default=0)
++    args = parser.parse_args()
++    Handler.tamper, Handler.lag = args.tamper, args.lag
++    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/oracles/read_utxo_tx/test/selftest.py b/oracles/read_utxo_tx/test/selftest.py
+new file mode 100755
+index 0000000..750ee40
+--- /dev/null
++++ b/oracles/read_utxo_tx/test/selftest.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python3
++"""Selftest for read_utxo_tx_service.py against mock_utxo_node.py. Run:
++    python3 test/mock_utxo_node.py --port 18745 &
++    python3 test/mock_utxo_node.py --port 18746 &
++    python3 test/mock_utxo_node.py --port 18747 --tamper &
++    python3 test/mock_utxo_node.py --port 18748 --lag 45 &
++    python3 test/selftest.py           (exit 0 = all pass)
++"""
++
++import os
++import socket
++import struct
++import sys
++import threading
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++
++import read_utxo_tx_service as svc
++
++DOGE = 2
++TXID_A = bytes.fromhex("d0" * 31 + "01")  # confirmed (50), 3 outputs
++TXID_M = bytes.fromhex("d0" * 31 + "02")  # mempool
++TXID_S = bytes.fromhex("d0" * 31 + "03")  # 5 confirmations
++TXID_O = bytes.fromhex("d0" * 31 + "04")  # orphaned block
++TXID_B = bytes.fromhex("d0" * 31 + "05")  # 200-byte script
++TXID_F = bytes.fromhex("d0" * 31 + "06")  # amount with 9 decimals
++TXID_X = bytes.fromhex("d0" * 31 + "ff")  # unknown
++BLOCK_A = bytes.fromhex("a1" * 32)
++P2PKH_SELLER = bytes.fromhex("76a914" + "5e" * 20 + "88ac")
++OP_RETURN_REF = bytes.fromhex("6a20" + "7a" * 32)
++
++NODE = "http://qubic:om@127.0.0.1:{}"
++failures = 0
++
++
++def check(cond, what):
++    global failures
++    print(f"  [{'PASS' if cond else 'FAIL'}] {what}")
++    if not cond:
++        failures += 1
++
++
++def query(network, txid, output, min_conf):
++    return struct.pack("<Q32sQQ", network, txid, output, min_conf)
++
++
++def u64(r, offset):
++    return struct.unpack("<Q", r[offset:offset + 8])[0]
++
++
++def use(*ports):
++    os.environ["UTXO_RPC_URLS_DOGECOIN"] = ",".join(NODE.format(p) for p in ports)
++    return svc.load_networks()
++
++
++def main():
++    networks = use(18745, 18746)
++
++    print("SUCCESS (Dogecoin payment output, 50 confirmations, two nodes agree):")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 0, 30))
++    check(flags == svc.NO_ERROR, "service answers")
++    check(len(r) == 208, "reply is 208 bytes")
++    check(u64(r, 0) == svc.SUCCESS, "code == SUCCESS")
++    check(r[8:40] == BLOCK_A, "blockHash in display order")
++    check(u64(r, 40) == 5_400_000 - 49, "blockHeight")
++    check(u64(r, 48) == 1764000000, "blockTime")
++    check(u64(r, 56) == 3, "outputCount == 3")
++    check(u64(r, 64) == 123_456_789_012, "value 1234.56789012 DOGE == 123,456,789,012 koinu (exact)")
++    check(u64(r, 72) == 25 and r[80:105] == P2PKH_SELLER, "P2PKH script byte-exact")
++    check(r[105:] == bytes(103), "script tail zero-padded")
++
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 1, 30))
++    check(u64(r, 0) == svc.SUCCESS and u64(r, 64) == 0 and r[80:114] == OP_RETURN_REF,
++          "OP_RETURN output: value 0, 32-byte trade reference readable")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 2, 30))
++    check(u64(r, 64) == 9_876_543_210_000, "large amount 98765.4321 DOGE exact")
++
++    print("Result codes:")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_X, 0, 30))
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.TX_NOT_FOUND and r[8:] == bytes(200),
++          "unknown tx (node error -5 over HTTP 500): code 3, rest zero")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_M, 0, 10))
++    check(u64(r, 0) == svc.NOT_CONFIRMED, "mempool tx: code 4")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_S, 0, 10))
++    check(u64(r, 0) == svc.NOT_CONFIRMED, "5 confirmations, 10 required: code 4")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_O, 0, 10))
++    check(u64(r, 0) == svc.NOT_CONFIRMED, "block reorganised away: code 4")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 3, 30))
++    check(u64(r, 0) == svc.OUTPUT_OUT_OF_RANGE, "output 3 of 3: code 5")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_B, 0, 30))
++    check(u64(r, 0) == svc.SCRIPT_TOO_LARGE, "200-byte script: code 6")
++    flags, r = svc.handle_query(networks, query(1, TXID_A, 0, 6))
++    check(u64(r, 0) == svc.NETWORK_UNSUPPORTED, "Bitcoin known but not configured: code 2")
++    flags, r = svc.handle_query(networks, query(4, TXID_A, 0, 6))
++    check(u64(r, 0) == svc.NETWORK_UNSUPPORTED, "unknown network 4: code 2")
++    flags, r = svc.handle_query(networks, query(0, TXID_A, 0, 6))
++    check(u64(r, 0) == svc.NETWORK_UNSUPPORTED, "network 0 (all-zero query): code 2")
++
++    print("Malformed queries (code 1):")
++    flags, r = svc.handle_query(networks, query(DOGE, bytes(32), 0, 30))
++    check(u64(r, 0) == svc.BAD_QUERY, "zero txid")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 0, 9))
++    check(u64(r, 0) == svc.BAD_QUERY, "9 confirmations is below Dogecoin's minimum of 10")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_A, 0, 1001))
++    check(u64(r, 0) == svc.BAD_QUERY, "1001 confirmations is above the maximum")
++    flags, r = svc.handle_query(networks, b"\x00" * 10)
++    check(flags == svc.INVALID_ARG, "wrong payload size: INVALID_ARG flag")
++
++    print("Confirmation boundary across nodes:")
++    flags, r = svc.handle_query(use(18745, 18748), query(DOGE, TXID_A, 0, 10))
++    check(u64(r, 0) == svc.NOT_CONFIRMED, "one node 45 blocks behind (5 conf there): code 4, not an answer")
++    flags, r = svc.handle_query(use(18745, 18748), query(DOGE, TXID_A, 0, 1000))
++    check(u64(r, 0) == svc.NOT_CONFIRMED, "deeper than either node: code 4")
++
++    print("Abstain (no reply payload committed):")
++    flags, r = svc.handle_query(use(18745, 18747), query(DOGE, TXID_A, 0, 30))
++    check(flags != svc.NO_ERROR and r == bytes(208), "node with a different amount: disagreement")
++    flags, r = svc.handle_query(use(18745, 1), query(DOGE, TXID_A, 0, 30))
++    check(flags != svc.NO_ERROR, "dead node")
++    flags, r = svc.handle_query(networks, query(DOGE, TXID_F, 0, 30))
++    check(flags != svc.NO_ERROR, "amount with 9 decimals: never rounded")
++    os.environ["UTXO_RPC_URLS_DOGECOIN"] = "http://qubic:wrong@127.0.0.1:18745"
++    flags, r = svc.handle_query(svc.load_networks(), query(DOGE, TXID_A, 0, 30))
++    check(flags != svc.NO_ERROR, "wrong RPC password")
++
++    print("Wire protocol (OM node framing over TCP):")
++    server = svc.Server(("127.0.0.1", 0), svc.Handler)
++    server.networks = use(18745, 18746)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    payload = query(DOGE, TXID_A, 0, 30)
++    size = 8 + 16 + len(payload)
++    frame = bytes([size & 0xFF, (size >> 8) & 0xFF, size >> 16, svc.OM_QUERY_TYPE]) + bytes(4)
++    frame += struct.pack("<QII", 4242, svc.INTERFACE_INDEX, 30000) + payload
++    with socket.create_connection(server.server_address, timeout=10) as s:
++        s.sendall(frame)
++        reply = svc.recv_exact(s, 8 + 16 + 208)
++    check(reply[3] == svc.OM_REPLY_TYPE and struct.unpack("<Q", reply[8:16])[0] == 4242,
++          "reply frame carries type 191 and the query id")
++    check(struct.unpack("<H", reply[16:18])[0] == svc.NO_ERROR and u64(reply[24:], 64) == 123_456_789_012,
++          "no error flags, value in the payload")
++    server.shutdown()
++
++    print(f"{'SELFTEST FAILED' if failures else 'SELFTEST PASSED'} ({failures} failure(s))")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

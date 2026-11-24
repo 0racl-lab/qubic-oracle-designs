@@ -13,7 +13,7 @@ jobs:
       # The action treats any path containing "oracle_interface" as an oracle interface (--oi).
       - uses: qubic/contract-verify@v1.2.5
         with:
-          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/BtcTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/ProofVerify.h'
+          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/ProofVerify.h'
 
   compile:
     name: compile against qubic/core and check layouts
@@ -25,3 +25,11 @@ jobs:
           repository: qubic/core
           path: .core
       - run: check/check.sh
+
+  implementation:
+    name: apply patches to qubic/core and oracle-machine, run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+      - run: check/implementation.sh

@@ -1,79 +1,89 @@
 # Qubic oracle designs
 
-Four proposed oracle interfaces for [Qubic](https://qubic.org), each written as a design note plus a header file in the exact format `qubic/core` uses for its own oracle interfaces.
+Proposed oracle interfaces for [Qubic](https://qubic.org). Two are implemented as ready-to-review patches for both repositories an oracle needs, **qubic/core** and **qubic/oracle-machine**. The other two are design notes with interface headers.
 
-> **Status:** design sketches for discussion. They are not part of qubic/core and have not been reviewed by the core or oracle team. Nothing here is live on the network.
+> **Status:** independent work, not part of Qubic and not yet reviewed by the core or oracle team. Nothing here is live on the network.
 
-| Oracle | In one line | What it unlocks | Fee |
+| Oracle | In one line | Status | Fee |
 |---|---|---|---|
-| [**ContentRead**](designs/content-read.md) | Read a file by its SHA-256 hash | Data registries, manifests, NFT metadata, storage markets | 60–690 QU |
-| [**BtcTxRead**](designs/btc-tx-read.md) | Read one output of a confirmed Bitcoin transaction | QU ⇄ BTC trades and BTC payments with no bridge | 1,000 QU |
-| [**EvmCallRead**](designs/evm-call-read.md) | Read EVM contract state at a finalized block | Token-gating, NFT ownership, collateral checks | 1,000 QU |
-| [**ProofVerify**](designs/proof-verify.md) | Verify a zero-knowledge proof off-chain | zkTLS fiat payment proofs, Web2 account proofs, privacy checks | 500–750 QU |
+| [**EvmCallRead**](designs/evm-call-read.md) | Read EVM contract state (`eth_call`) at a finalized block | **Implemented:** core interface 5 + `read_evm_call` service | 1,000 QU |
+| [**UtxoTxRead**](designs/utxo-tx-read.md) | Read one output of a confirmed **Dogecoin**, Bitcoin or Litecoin transaction | **Implemented:** core interface 6 + `read_utxo_tx` service | 1,000 QU |
+| [**ContentRead**](designs/content-read.md) | Read a file by its SHA-256 hash | Design + header | 60–690 QU |
+| [**ProofVerify**](designs/proof-verify.md) | Verify a zero-knowledge proof off-chain | Design + header | 500–750 QU |
 
-## Why these four
+## The implemented two
 
-Qubic's oracle machines each answer a query independently, and computors only accept a reply that a quorum agrees on byte for byte. So the easiest oracles to get right are the ones where **the right answer can't change**:
+Each follows Qubic's existing EvmLogRead / `read_evm_log` pair exactly:
 
-- **ContentRead:** the content hash fixes the bytes.
-- **BtcTxRead:** a block buried under enough confirmations doesn't change.
-- **EvmCallRead:** state at a finalized block is permanent.
-- **ProofVerify:** verifying a proof is pure maths.
+- **Interface conventions:** fixed-size query and reply, a `code` field, every other field zeroed on failure, time-varying failures marked retriable.
+- **Service conventions:** stdlib-only Python, the same OM node framing, configuration by environment variable.
+- **Safety:** multi-provider byte agreement, abstaining (committing nothing) on any disagreement or error.
 
-Each one follows the conventions of Qubic's existing interfaces (`Price`, `EvmLogRead`, `QubicLogRead`, `DogeShareValidation`, `Mock`):
+**EvmCallRead** lets a contract read what something *is* on an EVM chain at a fixed, finalized block: a token balance, an NFT owner, a pool's reserves. EvmLogRead only proves that an event happened. The call is pinned to the block hash (EIP-1898), runs from the zero address with a fixed 10M gas cap, and returns a revert as a result rather than a failure.
 
-- fixed-size query and reply structs within core's 1,008-byte limits;
-- a `code` field, with every other field zeroed on failure so failed replies also match;
-- time-varying failures marked as retriable.
+**UtxoTxRead** lets a contract settle on a Dogecoin payment, and on Bitcoin and Litecoin payments too, since all three share a transaction format and node RPC. The answer comes only once the transaction is deep enough on every node the oracle machine uses (Dogecoin minimum 10 confirmations). Amounts are exact koinu, and scripts are returned raw.
 
-## Repository layout
+### What the patches contain
 
-```
-designs/              one design note per oracle: what it's for, how it works, rules, limits, open questions
-oracle_interfaces/    the interface headers, drop-in format for qubic/core src/oracle_interfaces/
-check/                compiles the headers against qubic/core and checks their sizes and offsets
-.github/workflows/    CI: Qubic's contract-verify (oracle interface rules) + the compile check
-```
+| | qubic/core ([`patches/qubic-core.patch`](patches/qubic-core.patch)) | qubic/oracle-machine ([`patches/oracle-machine.patch`](patches/oracle-machine.patch)) |
+|---|---|---|
+| Interface / service | `src/oracle_interfaces/EvmCallRead.h`, `UtxoTxRead.h` | `oracles/read_evm_call/`, `oracles/read_utxo_tx/` |
+| Registration | `oracle_core/oracle_interfaces_def.h` (indices 5, 6), `Qubic.vcxproj` | `om_common` config (slots 5, 6), `docker-compose.yml`, `example_env`, CMake install |
+| Tests | 8 tests appended to `test/oracle_engine.cpp`, in the style of EvmLogRead's | `selftest.py` + mock nodes per service (29 and 33 checks), `live_check.py` for real endpoints |
+| Based on | `v1.313.0` (2fee231) | `72192da` |
+
+The headers in [`oracle_interfaces/`](oracle_interfaces) are byte-for-byte the ones the core patch adds; `check/implementation.sh` fails if they drift.
 
 ## Checks
 
 ```sh
-check/check.sh                         # clones qubic/core into .core the first time
-CORE=/path/to/qubic/core check/check.sh
+check/implementation.sh    # clones both upstream repos, applies the patches, runs all the tests
+check/check.sh             # compiles all four headers against qubic/core, checks sizes and offsets
 ```
 
-The check does two things:
+`implementation.sh` does five things:
 
-- **Compile:** builds the four headers against core's own QPI headers, alongside the five real interfaces. It confirms each query and reply fits core's limits and has exactly the size and field offsets documented in the header.
-- **Rules:** if Qubic's [contract-verify](https://github.com/qubic/contract-verify) tool is installed, it runs its oracle-interface rules (`contractverify --oi`) on each header. CI always runs both.
+1. Clones qubic/core at `v1.313.0` and oracle-machine at `72192da`, and applies the patches.
+2. Checks that the headers here match the patched core.
+3. Runs contract-verify's oracle-interface rules on the new headers, if the tool is installed.
+4. Builds and runs the 8 new core tests on Linux. Core's full suite is MSVC-only, but these tests only need QPI and the interface registry.
+5. Runs both services' selftests against their mock nodes.
 
-Current result, against qubic/core `2fee231` (v1.313.0):
+CI runs both scripts plus the official [contract-verify](https://github.com/qubic/contract-verify) action on every push.
+
+Last local run:
 
 ```
-ContentRead  query  208  reply  536  fee 60..690 QU
-BtcTxRead    query   56  reply  208  fee 1000 QU
-EvmCallRead  query  568  reply  568  fee 1000 QU
-ProofVerify  query  808  reply  112  fee 750/500 QU (by hash/inline)
-limits: query <= 1008, reply <= 1008 bytes
-Oracle interface compliance check PASSED  (x4)
+EvmCallRead: Oracle interface compliance check PASSED
+UtxoTxRead: Oracle interface compliance check PASSED
+[  PASSED  ] 8 tests.
+-- read_evm_call: SELFTEST PASSED (0 failure(s))
+-- read_utxo_tx (mock Dogecoin nodes): SELFTEST PASSED (0 failure(s))
 ```
+
+**Not tested yet:**
+
+- **Real endpoints and nodes.** The selftests use mocks. `live_check.py` in each service runs one real query against your own endpoints: Base or Ethereum RPCs for EvmCallRead, your own dogecoind for UtxoTxRead.
+- **Core's full MSVC suite on Windows.**
+- **A full network round trip** through a Qubic node and an oracle machine on a testnet.
 
 ## How an oracle interface gets added to Qubic
 
 Oracle interfaces don't go through a computor proposal or an IPO. Per core's [oracle guide](https://github.com/qubic/core/blob/main/doc/contracts_oracles.md), the steps are:
 
-1. **Write the interface header** in `src/oracle_interfaces/`. That's what `oracle_interfaces/` here contains.
-2. **Register it** in `src/oracle_core/oracle_interfaces_def.h`.
-3. **Write the reference service** in the [oracle-machine](https://github.com/qubic/oracle-machine) repository. Oracle machines run this code to answer queries.
-4. **Open pull requests.** Core developers review them, and the interface ships in a core release that computors choose to run.
+1. **Interface header** in `src/oracle_interfaces/`, registered in `src/oracle_core/oracle_interfaces_def.h`. That's the core patch.
+2. **Reference service** in [oracle-machine](https://github.com/qubic/oracle-machine). That's the oracle-machine patch, which needs its core submodule to point at a core with the new interfaces.
+3. **Pull requests** to both repositories, reviewed by core developers. The interface ships in a core release that computors choose to run.
 
-The guide asks for interfaces to be generic, so other contracts can reuse them. That is why none of these designs is tied to a single project.
+## Repository layout
 
-## Not covered yet
-
-- Reference services for the oracle machine. Each design note lists what the service must do, but there is no code yet.
-- Example contracts using each interface.
-- Fee levels are proposals. The core team and computors set the real ones.
+```
+designs/              one design note per oracle: purpose, how it works, rules, limits, tests, open questions
+oracle_interfaces/    the interface headers (drop-in format for qubic/core src/oracle_interfaces/)
+patches/              git format-patch files for qubic/core and qubic/oracle-machine
+check/                check.sh (headers vs core), implementation.sh (patches + all tests)
+.github/workflows/    CI
+```
 
 ## Contributing
 
@@ -81,4 +91,4 @@ Issues and pull requests are welcome, especially answers to the open questions a
 
 ## Licence
 
-[MIT](LICENSE). Qubic, qubic/core and contract-verify belong to their respective authors. This project is independent and not affiliated with or endorsed by Qubic.
+[MIT](LICENSE). The patches modify qubic/core and qubic/oracle-machine; those changes are offered under each project's own licence when contributed upstream. This project is independent and not affiliated with or endorsed by Qubic.
