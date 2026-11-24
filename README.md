@@ -12,6 +12,15 @@ Proposed oracle interfaces for [Qubic](https://qubic.org). Three are implemented
 | [**ProofVerify**](designs/proof-verify.md) | Verify a zero-knowledge proof off-chain | Design + header | 500–750 QU |
 | [**HttpRead**](designs/http-read.md) | Read one value from an approved public web API | Plan + draft header | 200 QU |
 
+## How Qubic oracles work (what this builds on)
+
+Two points from the oracle-machine developers shape every design here:
+
+- **Quorum agreement, not truth.** The oracle machine has no concept of truth. Computors accept a reply when a quorum of their oracle machines produced the same bytes, which stops anyone manipulating the path between the source and the contract. If one source isn't reliable enough, the oracle machine can combine several: the Price oracle's `gate_mexc` source already averages gate.io and MEXC for QUBIC/USDT.
+- **Contracts are the main users.** Oracles exist so contracts can actively query data from outside Qubic when their logic needs it. Queries sent by users are mainly for developers testing their work.
+
+So each interface here says exactly what a quorum is agreeing on (a log, a call result, a transaction output, a file's bytes, a source's published value), and leaves judging that data to the contract.
+
 ## The implemented three
 
 Each follows Qubic's existing EvmLogRead / `read_evm_log` pair exactly:
@@ -31,11 +40,12 @@ Each follows Qubic's existing EvmLogRead / `read_evm_log` pair exactly:
 [HttpRead](designs/http-read.md) explains why a literal "fetch any URL" oracle can't work on Qubic (machines must agree byte for byte, and the web doesn't), and what can:
 
 - **Reviewed adapters per source**, not raw URLs.
-- **Answers pinned** to a past timestamp or a final outcome.
+- **Answers pinned** to a past timestamp or a final published figure.
+- **Sources combined inside the oracle machine** where one provider isn't enough, like Price's `gate_mexc`.
 - **One field out**, scaled exactly.
 - **Abstain on any doubt.**
 
-It covers launch candidates (ECB reference rates via Frankfurter, Open-Meteo's weather archive), who decides which sources exist, and a phased roadmap up to median agreement for live values, which would need a core oracle-engine change.
+It covers launch candidates (ECB reference rates via Frankfurter, Open-Meteo's weather archive), who decides which sources exist, and a phased roadmap. It makes no claim to truth: a reply is what a quorum of oracle machines agreed the source said.
 
 ### What the patches contain
 

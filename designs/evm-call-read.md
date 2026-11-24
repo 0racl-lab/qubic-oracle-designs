@@ -6,7 +6,7 @@
 
 **In one line:** a contract asks for a read-only call to an EVM contract at a specific finalized block (for example `balanceOf(x)` on Base at block N), and the oracle returns the raw result.
 
-EvmLogRead proves that something **happened** (an event was emitted). EvmCallRead reads what something **is** at a fixed moment: a balance, an owner, a total supply, a price.
+EvmLogRead reads that something **happened** (an event was emitted). EvmCallRead reads what something **is** at a fixed moment: a balance, an owner, a total supply, a price.
 
 ## What it unlocks
 
@@ -55,7 +55,7 @@ State at a fixed, finalized block never changes. With the same block, the same c
 - **Pick a recent finalized block,** and remember the answer is "as of that block". A balance can change one block later.
 - **Use the right block number for the chain.** On rollups like Base and Arbitrum, finality comes from Ethereum and takes 10–30 minutes. Polygon and Avalanche finalize in seconds.
 - **Decode defensively:** check `reverted` and `dataLen` before reading the result.
-- **Only call contracts you trust to behave.** A malicious contract can return anything it likes; the oracle only proves what the call returned.
+- **Only call contracts you trust to behave.** A malicious contract can return anything it likes; the oracle only reports what the call returned.
 
 ## Security and abuse
 

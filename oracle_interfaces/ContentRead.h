@@ -8,12 +8,16 @@ using namespace QPI;
 * from the locator or from known mirrors, checks that SHA-256 of the full bytes equals the query's
 * hash, and returns the part the contract asked for: the file size, a byte range, or one JSON field.
 *
-* Determinism (see Price.h): the hash is the truth. Bytes that don't match it are discarded, so every
-* oracle machine that finds the file holds exactly the same bytes and gives the same reply. The only
-* thing that can differ between machines is whether the file was found in time; that shows up as
-* RESULT_NOT_FOUND, which contracts must treat as "not available right now", never as "does not
-* exist". A file larger than maxFileSize can't be verified (it is never downloaded in full), so it
-* is also RESULT_NOT_FOUND. On failure all reply fields except code MUST be zero.
+* Determinism (see Price.h): the hash decides which bytes are accepted. Bytes that don't match it are
+* discarded, so every oracle machine that finds the file holds exactly the same bytes and gives the
+* same reply. The only thing that can differ between machines is whether the file was found in time;
+* that shows up as RESULT_NOT_FOUND, which contracts must treat as "not available right now", never
+* as "does not exist". A file larger than maxFileSize can't be checked (it is never downloaded in
+* full), so it is also RESULT_NOT_FOUND. On failure all reply fields except code MUST be zero.
+*
+* Like every Qubic oracle, a reply is what a quorum of computors' oracle machines agreed they read:
+* here, that bytes with this hash were retrievable. Whether the content is right is for the
+* contract and whoever published the file.
 *
 * Served by oracle-machine oracles/read_content (208-byte query, 536-byte reply).
 */
@@ -37,7 +41,7 @@ struct ContentRead
     //--- What to return
     struct Mode
     {
-        static constexpr uint64 size      = 1;  ///< only fileSize: proves the file is available now
+        static constexpr uint64 size      = 1;  ///< only fileSize: the file was available when queried
         static constexpr uint64 byteRange = 2;  ///< `length` bytes from `offset`
         static constexpr uint64 jsonField = 3;  ///< parse the file as JSON and return one value (RFC 8785 canonical form)
         // add new modes above this line
@@ -66,7 +70,7 @@ struct ContentRead
     /// Oracle query data / input to the oracle machine. Fixed 208 bytes.
     struct OracleQuery
     {
-        /// SHA-256 of the complete file. This is the truth; the locator is only a hint.
+        /// SHA-256 of the complete file. Only bytes with this hash are accepted; the locator is only a hint.
         Array<uint8, 32> sha256;     // [0..32)
 
         /// One of LocatorKind.

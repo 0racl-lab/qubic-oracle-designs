@@ -1,4 +1,4 @@
-From 006c79967c6a1706b3b03496c4a64b53f33d8c73 Mon Sep 17 00:00:00 2001
+From d6f2912ce32587c58eccee3e054fa09676392d24 Mon Sep 17 00:00:00 2001
 From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 17:41:59 +0000
 Subject: [PATCH 2/2] Add read_content service (interface 7)
@@ -178,7 +178,7 @@ index 0000000..459944d
 +        RENAME read_content_service)
 diff --git a/oracles/read_content/README.md b/oracles/read_content/README.md
 new file mode 100644
-index 0000000..e283d28
+index 0000000..97b1956
 --- /dev/null
 +++ b/oracles/read_content/README.md
 @@ -0,0 +1,111 @@
@@ -200,7 +200,7 @@ index 0000000..e283d28
 +
 +| offset | size | field         | notes                                                       |
 +|-------:|-----:|---------------|-------------------------------------------------------------|
-+| 0      | 32   | `sha256`      | SHA-256 of the whole file: **the truth**                    |
++| 0      | 32   | `sha256`      | SHA-256 of the whole file: decides which bytes are accepted |
 +| 32     | 8    | `locatorKind` | 0 none (mirrors only), 1 IPFS CID, 2 Arweave id             |
 +| 40     | 8    | `locatorLen`  | 0 for none; 1..64                                           |
 +| 48     | 64   | `locator`     | CID (`[A-Za-z0-9]`) or 43-char Arweave id; **only a hint**  |
@@ -238,7 +238,7 @@ index 0000000..e283d28
 +
 +## Determinism guarantees
 +
-+- **The hash is the truth.** Bytes that don't hash to `sha256` are discarded and the next source is
++- **The hash decides which bytes are accepted.** Bytes that don't hash to `sha256` are discarded and the next source is
 +  tried, so a lying gateway can waste time but never change an answer. Every machine that answers
 +  holds the same bytes.
 +- **Sizes and ranges** follow directly from the verified bytes.

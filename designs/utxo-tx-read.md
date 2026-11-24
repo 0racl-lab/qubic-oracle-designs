@@ -6,7 +6,7 @@
 
 **In one line:** a contract asks for one output of a Dogecoin (or Bitcoin, or Litecoin) transaction. Once the transaction is buried under enough blocks, the oracle returns that output's value and script, and the block it's in.
 
-It is the UTXO sibling of EvmLogRead. EvmLogRead lets a Qubic contract prove that a USDC payment happened on an EVM chain; UtxoTxRead does the same for DOGE, BTC and LTC, with no bridge and no wrapped token.
+It is the UTXO sibling of EvmLogRead. EvmLogRead lets a Qubic contract read a USDC payment on an EVM chain; UtxoTxRead does the same for DOGE, BTC and LTC, with no bridge and no wrapped token.
 
 ## Why one interface for three chains
 

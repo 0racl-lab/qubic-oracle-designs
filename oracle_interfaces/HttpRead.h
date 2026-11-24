@@ -12,7 +12,7 @@ using namespace QPI;
 *
 * Determinism (see Price.h): only endpoints whose answer cannot change are allowed in phase 1:
 *   - historical values for a past timestamp (a daily FX reference rate, a day's weather record), or
-*   - final event outcomes, where the adapter checks the source's own "final" flag and answers
+*   - final published figures, where the adapter checks the source's own "final" flag and answers
 *     RESULT_NOT_FINAL until then (retriable).
 * Numbers are taken from the response TEXT as exact decimals, scaled by 10^decimals and rounded
 * half-to-even, never via floating point. On failure all reply fields except code MUST be zero. A

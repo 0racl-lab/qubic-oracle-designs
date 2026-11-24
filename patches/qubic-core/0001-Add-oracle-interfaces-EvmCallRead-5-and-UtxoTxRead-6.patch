@@ -1,4 +1,4 @@
-From 6aaf536db84845620db4a5217f6e314709ab3e85 Mon Sep 17 00:00:00 2001
+From d42b50891e6c5c8b0ad28c781a3a23b4a3dce306 Mon Sep 17 00:00:00 2001
 From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 17:41:59 +0000
 Subject: [PATCH 1/2] Add oracle interfaces EvmCallRead (5) and UtxoTxRead (6)
@@ -92,7 +92,7 @@ index db22134..d386b21 100644
  		for (uint32_t idx = 0; idx < oracleInterfacesCount; ++idx)
 diff --git a/src/oracle_interfaces/EvmCallRead.h b/src/oracle_interfaces/EvmCallRead.h
 new file mode 100644
-index 0000000..c983b13
+index 0000000..f114cf1
 --- /dev/null
 +++ b/src/oracle_interfaces/EvmCallRead.h
 @@ -0,0 +1,143 @@
@@ -107,7 +107,7 @@ index 0000000..c983b13
 +* or price getter. No ABI semantics are baked in: the querying contract encodes the calldata and
 +* decodes the result itself.
 +*
-+* It complements EvmLogRead: EvmLogRead proves that something HAPPENED (an event was emitted),
++* It complements EvmLogRead: EvmLogRead reads that something HAPPENED (an event was emitted),
 +* EvmCallRead reads what something IS at a fixed block.
 +*
 +* Determinism requirement (see Price.h): state at a fixed past block never changes, so the result is

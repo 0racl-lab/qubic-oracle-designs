@@ -31,7 +31,7 @@
 
 | Query field | Size | Meaning |
 |---|---|---|
-| `sha256` | 32 | SHA-256 of the complete file. **The truth.** |
+| `sha256` | 32 | SHA-256 of the complete file. **Decides which bytes are accepted.** |
 | `locatorKind` | 8 | 0 = known mirrors only, 1 = IPFS CID, 2 = Arweave id |
 | `locatorLen`, `locator` | 8 + 64 | Where to look, as ASCII. **Only a hint.** |
 | `maxFileSize` | 8 | Refuse anything bigger (max 64 MiB). Also sets the fee. |

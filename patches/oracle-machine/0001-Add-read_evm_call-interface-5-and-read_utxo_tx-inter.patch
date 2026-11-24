@@ -1,4 +1,4 @@
-From 1aa2c5ab39ff9fb859070308a0e94fb402583f97 Mon Sep 17 00:00:00 2001
+From 5c8432e03f5f765b55e1a8c80ffddc2982a525cd Mon Sep 17 00:00:00 2001
 From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 17:41:59 +0000
 Subject: [PATCH 1/2] Add read_evm_call (interface 5) and read_utxo_tx
@@ -234,7 +234,7 @@ index 0000000..772cc83
 +        RENAME read_evm_call_service)
 diff --git a/oracles/read_evm_call/README.md b/oracles/read_evm_call/README.md
 new file mode 100644
-index 0000000..c880967
+index 0000000..332ceae
 --- /dev/null
 +++ b/oracles/read_evm_call/README.md
 @@ -0,0 +1,98 @@
@@ -245,7 +245,7 @@ index 0000000..c880967
 +uses: `balanceOf`, `ownerOf`, `totalSupply`, reserve or price getters. No ABI is baked in: the
 +querying Qubic smart contract encodes the call and decodes the result itself.
 +
-+It complements `read_evm_log`: that service proves something **happened** (an event), this one reads
++It complements `read_evm_log`: that service reads that something **happened** (an event), this one reads
 +what something **is** at a fixed block.
 +
 +Implemented in Python (`read_evm_call_service.py`, stdlib only), with the same OM node <-> service

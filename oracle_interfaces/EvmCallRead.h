@@ -9,7 +9,7 @@ using namespace QPI;
 * or price getter. No ABI semantics are baked in: the querying contract encodes the calldata and
 * decodes the result itself.
 *
-* It complements EvmLogRead: EvmLogRead proves that something HAPPENED (an event was emitted),
+* It complements EvmLogRead: EvmLogRead reads that something HAPPENED (an event was emitted),
 * EvmCallRead reads what something IS at a fixed block.
 *
 * Determinism requirement (see Price.h): state at a fixed past block never changes, so the result is
