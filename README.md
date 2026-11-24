@@ -44,7 +44,7 @@ Each follows Qubic's existing EvmLogRead / `read_evm_log` pair exactly:
 - **One field out**, scaled exactly.
 - **Abstain on any doubt.**
 
-It covers launch candidates (ECB reference rates via Frankfurter, Open-Meteo's weather archive), who decides which sources exist, and a phased roadmap. It makes no claim to truth: a reply is what a quorum of oracle machines agreed the source said.
+It covers launch candidates (ECB reference rates via Frankfurter, Open-Meteo's weather archive), who decides which sources exist, and a phased roadmap. The last phase lets feeds be voted in through a FeedRegistry contract, while the fetching stays in reviewed oracle-machine code. It makes no claim to truth: a reply is what a quorum of oracle machines agreed the source said.
 
 ### What the patches contain
 

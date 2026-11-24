@@ -101,7 +101,79 @@ All of these need their terms and their exact behaviour confirmed before an adap
 ## Who decides which sources exist
 
 - **Phase 1:** the source list is code. A new adapter is a pull request to oracle-machine, plus its id in the core header. Core developers review it, and it goes live when computors run the release. That is slow, but every machine runs the same adapters, which is what agreement needs.
-- **Later:** a governed registry. That could be a contract whose shareholders vote sources in and out, which oracle machines read before answering. It needs a way for machines to read contract state and a migration path, so it should come after phase 1 has proved itself.
+- **Later:** feeds governed by a registry contract, so adding a feed is a shareholder vote rather than a core release. See [Feeds governed by a registry contract](#feeds-governed-by-a-registry-contract) below.
+
+## Feeds governed by a registry contract
+
+Phase 1 puts every source in reviewed code, so each new feed waits for a release. The step after that is to let feeds be **voted in**, while keeping the fetching itself in reviewed code. Contracts can't make web requests, so this has two parts that work together.
+
+### Part 1: a FeedRegistry smart contract
+
+A normal Qubic contract, proposed, voted and IPO'd like any other. It keeps the list of approved feeds.
+
+**What a feed entry holds.** Every field is fixed-size and checked when the feed is proposed:
+
+| Field | Meaning |
+|---|---|
+| `urlTemplate` (256 B) | `https://` URL with numbered placeholders, e.g. `https://api.example.org/v1/rate?day={date}&pair={0}` |
+| `paramKinds` (4 × 1 B) | What each placeholder accepts, from a fixed list: ISO date, currency code, integer, decimal, slug (`[a-z0-9-]{1,32}`), coordinate. **No free text and no regular expressions** |
+| `timePolicy` | `historical` with a minimum age (e.g. answer only for days at least 1 day old), or `final` with the path of the source's "final" flag |
+| `valuePath` (64 B) | Field to extract from the JSON response |
+| `valueType`, `decimals` | As in the HttpRead query: decimal, text or boolean |
+| `restrictedTo` | Optional: the only contract allowed to use this feed (the "X URL for Y contract" case) |
+| `feePerUse` | Optional QU fee to the registry for each use |
+| `definitionHash` | SHA-256 of all the fields above, so a query can pin the exact version |
+| `status`, `proposer`, `deposit` | Proposed, approved or retired; who proposed it; their deposit |
+
+**Procedures (sketch):**
+
+- `ProposeFeed(entry)`: anyone, with a deposit. The contract checks the entry's shape: `https` only, a host name rather than an IP address, known parameter kinds, sizes within limits. It stores the entry as proposed.
+- `VoteFeed(feedId, yes/no)`: shareholders, using QPI's existing shareholder-voting helpers. Approval sets the status to approved and returns the deposit; rejection keeps part of it.
+- `RetireFeed(feedId)`: by shareholder vote, or by the proposer. Retired entries stay readable but can't be used.
+- `UseFeed(feedId)`: called by a consumer contract before it queries, paying `feePerUse` and checking `restrictedTo`. It is optional in a first version.
+- Functions: `GetFeed(feedId)` (the entry and its hash) and `ListFeeds(start)`.
+
+**Who earns.** Fees go to shareholders and a share to the feed's proposer, which pays for curating feeds. The oracle query fee itself is still paid to the oracle as usual.
+
+### Part 2: a FeedRead oracle interface and service
+
+Code pull requests to core and oracle-machine, like the other interfaces in this repo.
+
+| Query field | Size | Meaning |
+|---|---|---|
+| `feedId` | 8 | Entry in the registry |
+| `definitionHash` | 32 | The version of the entry the contract expects |
+| `timestamp` | 8 | The moment the value is for |
+| `params` | 128 | Up to 4 × 32-byte parameters, checked against the entry's `paramKinds` |
+
+The reply has the same 160-byte shape as HttpRead.
+
+**What each oracle machine does:**
+
+1. Reads the entry by calling the registry's `GetFeed` function. Contract state is public: anyone can read it through Qubic's RPC (this is how explorers and apps show it). A machine should use its own Bob node, but it doesn't have to trust whoever serves it, because of the next step.
+2. Checks the entry is approved and that its hash equals `definitionHash`. If not, the answer is `FEED_MISMATCH`, never a fetch with a different definition. The query carries the hash, so a tampered entry from any server is rejected, the same way ContentRead rejects wrong bytes.
+3. Checks the parameters against their kinds and the timestamp against the time policy.
+4. Fills in the template and fetches under the service's **hard-coded safety policy**:
+   - GET only;
+   - the host must resolve to a public address, so no private, loopback or link-local addresses;
+   - no redirects to another host;
+   - size and time caps, and a rate limit per domain.
+
+   A vote can't loosen any of these.
+5. Extracts the value exactly as the entry says (text-based decimals, no floating point), or abstains on any error or disagreement.
+
+### Why this split
+
+- **New feeds don't need a core release.** A shareholder vote approves them.
+- **The dangerous parts stay in reviewed code:** network access, timeouts, extraction and agreement.
+- **The definition hash keeps machines in agreement** even while the registry changes. Every machine either uses exactly the version the contract named or refuses.
+- **It still only suits feeds that can answer "value at time T", or that publish final figures.** A vote can't make a constantly changing page agree across hundreds of machines. Shareholders should check this before approving a feed.
+
+### What has to be agreed first
+
+- **Oracle machines reading contract state.** The state itself is public; the new part is that an oracle service would depend on it to decide what to fetch. Today services read outside sources and Qubic logs. Because the query pins the definition by hash, a wrong or stale read can only cause a refusal, never a wrong fetch. It's still the core team's decision, and nothing should be built before that's agreed.
+- **Order of work:** the FeedRead interface and service first, against a test registry. Then the FeedRegistry contract proposal, since a registry without the oracle is useless.
+- **Responsibility:** a voted-in feed is only as good as its source. Shareholders take on the job of not approving feeds that misbehave, and of retiring ones that do.
 
 ## Phases
 
@@ -110,7 +182,8 @@ All of these need their terms and their exact behaviour confirmed before an adap
 | **0. Agree** | Confirm with the core and oracle team that a narrow HttpRead is wanted, and agree the interface shape and fee | This note; a dev-channel thread |
 | **1. Historical values** | The `HttpRead` interface; a shared `read_http` service with the double fetch and agreement checks; Frankfurter and Open-Meteo archive adapters; recorded-response selftests; core tests in the style of this repo's other interfaces | No core engine change |
 | **2. Combined sources and finality** | Combined-source adapters (several providers averaged inside the machine, like `gate_mexc`); `NOT_FINAL` handling for figures that are published once final | Sources with suitable terms |
-| **3. Moving values and governance** | Values that change all day, handled the way Price handles prices: pinned to an exact timestamp, from providers that can answer "the value at time T", combined across providers. Plus the governed source registry | No engine change while answers stay byte-identical; anything else is the core team's call |
+| **3. Moving values** | Values that change all day, handled the way Price handles prices: pinned to an exact timestamp, from providers that can answer "the value at time T", combined across providers | No engine change while answers stay byte-identical |
+| **4. Voted-in feeds** | The FeedRead interface and service, then the FeedRegistry contract (see above) | Core team agreement that oracle machines may read contract state; a contract proposal and vote |
 
 ## How it fits with the other oracles
 
@@ -124,4 +197,5 @@ All of these need their terms and their exact behaviour confirmed before an adap
 - [ ] Should adapters live in one `read_http` service or one service each?
 - [ ] Is the double fetch per machine worth its cost, or is cross-machine agreement enough?
 - [ ] Should combined sources (as with Price's `gate_mexc`) be the default for anything numeric?
+- [ ] Would an oracle service be allowed to depend on a registry contract's (public) state to decide what to fetch, given the definition is pinned by hash in each query?
 - [ ] What fee range would computors accept for web reads?
