@@ -1,0 +1,27 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  contract-verify:
+    name: contract-verify (oracle interface rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The action treats any path containing "oracle_interface" as an oracle interface (--oi).
+      - uses: qubic/contract-verify@v1.2.5
+        with:
+          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/BtcTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/ProofVerify.h'
+
+  compile:
+    name: compile against qubic/core and check layouts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: qubic/core
+          path: .core
+      - run: check/check.sh
