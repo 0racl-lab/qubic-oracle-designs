@@ -9,7 +9,7 @@ jobs:
     name: contract-verify (oracle interface rules)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The action treats any path containing "oracle_interface" as an oracle interface (--oi).
       - uses: qubic/contract-verify@v1.2.5
         with:
@@ -19,8 +19,8 @@ jobs:
     name: compile against qubic/core and check layouts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           repository: qubic/core
           path: .core
@@ -30,6 +30,6 @@ jobs:
     name: apply patches to qubic/core and oracle-machine, run tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
       - run: check/implementation.sh
