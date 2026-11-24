@@ -1,6 +1,6 @@
 # Qubic oracle designs
 
-Proposed oracle interfaces for [Qubic](https://qubic.org). Three are implemented as ready-to-review patches for both repositories an oracle needs, **qubic/core** and **qubic/oracle-machine**. Two more are design notes with draft interface headers, including a plan for a safe "curl" oracle.
+Proposed oracle interfaces for [Qubic](https://qubic.org). Three are implemented as ready-to-review patches for both repositories an oracle needs, **qubic/core** and **qubic/oracle-machine**. A fourth, HttpRead, is a plan with a draft interface header for a safe "curl" oracle.
 
 > **Status:** independent work, not part of Qubic and not yet reviewed by the core or oracle team. Nothing here is live on the network.
 
@@ -9,7 +9,6 @@ Proposed oracle interfaces for [Qubic](https://qubic.org). Three are implemented
 | [**EvmCallRead**](designs/evm-call-read.md) | Read EVM contract state (`eth_call`) at a finalized block | **Implemented:** core interface 5 + `read_evm_call` service | 1,000 QU |
 | [**UtxoTxRead**](designs/utxo-tx-read.md) | Read one output of a confirmed **Dogecoin**, Bitcoin or Litecoin transaction | **Implemented:** core interface 6 + `read_utxo_tx` service | 1,000 QU |
 | [**ContentRead**](designs/content-read.md) | Read a file by its SHA-256 hash: size, byte range or one JSON field | **Implemented:** core interface 7 + `read_content` service | 60–690 QU |
-| [**ProofVerify**](designs/proof-verify.md) | Verify a zero-knowledge proof off-chain | Design + header | 500–750 QU |
 | [**HttpRead**](designs/http-read.md) | Read one value from an approved public web API | Plan + draft header | 200 QU |
 
 ## How Qubic oracles work (what this builds on)
@@ -64,7 +63,7 @@ The headers in [`oracle_interfaces/`](oracle_interfaces) are byte-for-byte the o
 
 ```sh
 check/implementation.sh    # clones both upstream repos, applies the patches, runs all the tests
-check/check.sh             # compiles all five headers against qubic/core, checks sizes and offsets
+check/check.sh             # compiles all four headers against qubic/core, checks sizes and offsets
 ```
 
 `implementation.sh` does five things:

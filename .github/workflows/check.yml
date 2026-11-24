@@ -13,7 +13,7 @@ jobs:
       # The action treats any path containing "oracle_interface" as an oracle interface (--oi).
       - uses: qubic/contract-verify@v1.2.5
         with:
-          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/ProofVerify.h,oracle_interfaces/HttpRead.h'
+          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/HttpRead.h'
 
   compile:
     name: compile against qubic/core and check layouts

@@ -82,7 +82,7 @@ When machines split on that, the query simply times out without a quorum. That i
 
 - **Version 2, items by Merkle root.** The contract stores one root for a dataset of millions of items, and the oracle returns item *i* with its proof checked against the root. Large datasets work without storing anything big on-chain.
 - **Data registry contract:** records datasets by fingerprint, contributors and licences, and pays royalties when data is used.
-- **Storage market contract:** users prepay QU to keep a file available for N epochs. Providers post a deposit and get paid each epoch, and the contract spot-checks random pieces through ContentRead. This proves a provider could serve the pieces when asked, not that it stores the whole file. Full proof-of-storage would need [ProofVerify](proof-verify.md).
+- **Storage market contract:** users prepay QU to keep a file available for N epochs. Providers post a deposit and get paid each epoch, and the contract spot-checks random pieces through ContentRead. This proves a provider could serve the pieces when asked, not that it stores the whole file. Full proof-of-storage would need zero-knowledge proofs checked by the contract.
 
 ## Tests
 

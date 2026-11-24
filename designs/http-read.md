@@ -115,7 +115,7 @@ All of these need their terms and their exact behaviour confirmed before an adap
 ## How it fits with the other oracles
 
 - **ContentRead:** if the data can be published as a file (a results list, a dataset), publishing it and reading it by hash is simpler and stronger than any web read.
-- **ProofVerify (zkTLS):** for data behind a login, like a bank balance or a private account, a zkTLS proof lets the user prove what a website showed them without sharing credentials. HttpRead can only ever read public data.
+- **Zero-knowledge proofs (zkTLS):** for data behind a login, like a bank balance or a private account, a zkTLS proof lets the user prove what a website showed them without sharing credentials. HttpRead can only ever read public data.
 - **Signed data:** a provider that signs its results with a Qubic key needs no oracle at all, because contracts can check signatures with `qpi.signatureValidity`. That suits paid or licensed data. The trade-off is trusting one signer instead of the computor quorum.
 
 ## Open questions for the core and oracle team
