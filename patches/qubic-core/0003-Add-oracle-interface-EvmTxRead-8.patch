@@ -1,0 +1,426 @@
+From ce2abc953a8e2b787a80d262342ccce2bb4632da Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:16:32 +0000
+Subject: [PATCH 3/3] Add oracle interface EvmTxRead (8)
+
+One finalized EVM transaction: block number, block hash, block timestamp,
+position, sender, recipient, native value, nonce, type, status and log
+count. The sibling of EvmLogRead: EvmLogRead returns what a transaction
+emitted, EvmTxRead returns when and by whom, so a contract can accept a
+token transfer only if it was made after a given moment. A reverted
+transaction is a final answer (status 0). getBlockDateAndTime converts
+the block time to a QPI DateAndTime for comparison with qpi.now().
+Same chains and fee as EvmLogRead. Registered in oracle_interfaces_def.h;
+tests added to test/oracle_engine.cpp.
+Reference service: oracle-machine oracles/read_evm_tx.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ src/Qubic.vcxproj                       |   1 +
+ src/Qubic.vcxproj.filters               |   3 +
+ src/oracle_core/oracle_interfaces_def.h |   6 +
+ src/oracle_interfaces/EvmTxRead.h       | 161 ++++++++++++++++++++++++
+ test/oracle_engine.cpp                  | 157 ++++++++++++++++++++++-
+ 5 files changed, 326 insertions(+), 2 deletions(-)
+ create mode 100644 src/oracle_interfaces/EvmTxRead.h
+
+diff --git a/src/Qubic.vcxproj b/src/Qubic.vcxproj
+index c3d242b..5a94e1c 100644
+--- a/src/Qubic.vcxproj
++++ b/src/Qubic.vcxproj
+@@ -126,6 +126,7 @@
+     <ClInclude Include="oracle_interfaces\EvmCallRead.h" />
+     <ClInclude Include="oracle_interfaces\UtxoTxRead.h" />
+     <ClInclude Include="oracle_interfaces\ContentRead.h" />
++    <ClInclude Include="oracle_interfaces\EvmTxRead.h" />
+     <ClInclude Include="platform\assert.h" />
+     <ClInclude Include="platform\concurrency.h" />
+     <ClInclude Include="four_q.h" />
+diff --git a/src/Qubic.vcxproj.filters b/src/Qubic.vcxproj.filters
+index b4d803d..41f8d55 100644
+--- a/src/Qubic.vcxproj.filters
++++ b/src/Qubic.vcxproj.filters
+@@ -478,6 +478,9 @@
+     <ClInclude Include="oracle_interfaces\ContentRead.h">
+       <Filter>oracle_interfaces</Filter>
+     </ClInclude>
++    <ClInclude Include="oracle_interfaces\EvmTxRead.h">
++      <Filter>oracle_interfaces</Filter>
++    </ClInclude>
+     <ClInclude Include="optimizations\opt_parallel_sign_votes.h">
+       <Filter>optimizations</Filter>
+     </ClInclude>
+diff --git a/src/oracle_core/oracle_interfaces_def.h b/src/oracle_core/oracle_interfaces_def.h
+index 9e460d4..51a0810 100644
+--- a/src/oracle_core/oracle_interfaces_def.h
++++ b/src/oracle_core/oracle_interfaces_def.h
+@@ -37,6 +37,10 @@ namespace OI
+ #include "oracle_interfaces/ContentRead.h"
+ #undef ORACLE_INTERFACE_INDEX
+ 
++#define ORACLE_INTERFACE_INDEX 8
++#include "oracle_interfaces/EvmTxRead.h"
++#undef ORACLE_INTERFACE_INDEX
++
+ // add new interface above this line (define ORACLE_INTERFACE_INDEX, include the header file and undef ORACLE_INTERFACE_INDEX)
+ 
+ #define DEFINE_ORACLE_INTERFACE(Interface) {sizeof(Interface::OracleQuery), sizeof(Interface::OracleReply)}
+@@ -53,6 +57,7 @@ namespace OI
+ 		DEFINE_ORACLE_INTERFACE(EvmCallRead),
+ 		DEFINE_ORACLE_INTERFACE(UtxoTxRead),
+ 		DEFINE_ORACLE_INTERFACE(ContentRead),
++		DEFINE_ORACLE_INTERFACE(EvmTxRead),
+ 		// add new interface above this line (with DEFINE_ORACLE_INTERFACE; the order must match the interfaces indices)
+ 	};
+ 
+@@ -88,6 +93,7 @@ namespace OI
+ 		REGISTER_ORACLE_INTERFACE(EvmCallRead);
+ 		REGISTER_ORACLE_INTERFACE(UtxoTxRead);
+ 		REGISTER_ORACLE_INTERFACE(ContentRead);
++		REGISTER_ORACLE_INTERFACE(EvmTxRead);
+ 		// add new interface above this line (with REGISTER_ORACLE_INTERFACE)
+ 
+ 		for (uint32_t idx = 0; idx < oracleInterfacesCount; ++idx)
+diff --git a/src/oracle_interfaces/EvmTxRead.h b/src/oracle_interfaces/EvmTxRead.h
+new file mode 100644
+index 0000000..d87c399
+--- /dev/null
++++ b/src/oracle_interfaces/EvmTxRead.h
+@@ -0,0 +1,161 @@
++using namespace QPI;
++
++/**
++* Oracle interface "EvmTxRead" (see Price.h for general documentation about oracle interfaces).
++*
++* Generic cross-chain read of ONE FINALIZED EVM TRANSACTION: where and when it was included, who
++* sent it, to whom, the native value, and whether it succeeded. Given (chainId, txHash) the oracle
++* machine returns the block number, block hash, block timestamp, position in the block, sender,
++* recipient, value, nonce, transaction type, status and number of logs.
++*
++* It is the sibling of EvmLogRead: EvmLogRead returns WHAT a transaction emitted (one raw log),
++* EvmTxRead returns WHEN and BY WHOM it happened. Together they let a contract accept a token
++* transfer only if it was made after a given moment, which a log alone cannot show. Example:
++*   1. EvmLogRead(chainId, txHash, logIndex) -> an ERC-20 Transfer log: token, from, to, amount;
++*   2. EvmTxRead(chainId, txHash)            -> blockTimestamp, status;
++*   3. the contract checks the timestamp is after the order was opened and status == 1.
++* No ABI semantics are baked in.
++*
++* Determinism requirement (see Price.h): the oracle machine MUST only answer for transactions in
++* blocks at or below the chain's finalized head (RESULT_TX_NOT_FINALIZED otherwise), MUST take
++* blockTimestamp from the block the receipt names (checking block hash and number agree), and MUST
++* zero all reply fields except code on failure, so replies are byte-identical across computors.
++* A reverted transaction is a final, deterministic fact: it is returned as RESULT_SUCCESS with
++* status = 0, so a contract can tell "failed" apart from "not there yet".
++*
++* Served by oracle-machine oracles/read_evm_tx (40-byte query, 192-byte reply).
++*/
++struct EvmTxRead
++{
++    //-------------------------------------------------------------------------
++    // Mandatory oracle interface definitions
++
++    /// Chain ids (decimal) of supported EVM networks: the same set as EvmLogRead.
++    struct ChainId
++    {
++        static constexpr uint64 ethereum  = 1;       // 0x1
++        static constexpr uint64 optimism  = 10;      // 0xa
++        static constexpr uint64 bsc       = 56;      // 0x38
++        static constexpr uint64 polygon   = 137;     // 0x89
++        static constexpr uint64 fantom    = 250;     // 0xfa
++        static constexpr uint64 base      = 8453;    // 0x2105
++        static constexpr uint64 avalanche = 43114;   // 0xa86a
++        static constexpr uint64 arbitrum  = 42161;   // 0xa4b1
++        static constexpr uint64 sepolia   = 11155111;// 0xaa36a7 (Ethereum Sepolia testnet)
++        // add new chain ids above this line
++    };
++
++    /// Return true if the chain id is one this oracle is expected to serve.
++    static bool isSupportedChain(uint64 chainId)
++    {
++        return chainId == ChainId::ethereum
++            || chainId == ChainId::optimism
++            || chainId == ChainId::bsc
++            || chainId == ChainId::polygon
++            || chainId == ChainId::fantom
++            || chainId == ChainId::base
++            || chainId == ChainId::avalanche
++            || chainId == ChainId::arbitrum
++            || chainId == ChainId::sepolia;
++    }
++
++    /// Oracle interface index
++    static constexpr uint32 oracleInterfaceIndex = ORACLE_INTERFACE_INDEX;
++
++    //--- Result codes returned in OracleReply.code. 0 means success; any non-zero value is a failure
++    //    reason and implies all other reply fields are all-zero.
++    static constexpr uint64 RESULT_SUCCESS          = 0;  ///< tx found in a finalized block; reply fields valid (check status)
++    static constexpr uint64 RESULT_BAD_QUERY        = 1;  ///< malformed query (zero tx hash)
++    static constexpr uint64 RESULT_CHAIN_UNSUPPORTED = 2; ///< chainId not served by this oracle
++    static constexpr uint64 RESULT_TX_NOT_FOUND     = 3;  ///< no endpoint knows the transaction
++    static constexpr uint64 RESULT_TX_NOT_FINALIZED = 4;  ///< pending, or its block is above the finalized head
++    // add new result codes above this line
++    //
++    // Codes 3/4 are time-varying observations: treat as retriable, never proof of permanent absence;
++    // near the finality boundary computors may split and the query just times out. Retrying is the
++    // job of the querier, not of the oracle machine.
++
++    /// Transaction status values (OracleReply.status), as in the EVM receipt.
++    static constexpr uint64 STATUS_REVERTED = 0;
++    static constexpr uint64 STATUS_SUCCESS  = 1;
++
++    /// Oracle query data / input to the oracle machine. Fixed 40 bytes.
++    struct OracleQuery
++    {
++        /// EVM chain id (decimal), e.g. EvmTxRead::ChainId::ethereum.
++        uint64 chainId;                  // [0..8)
++
++        /// Transaction hash (32-byte big-endian EVM tx hash).
++        Array<uint8, 32> txHash;         // [8..40)
++    };
++
++    /// Oracle reply data / output of the oracle machine. Fixed 192 bytes.
++    /// On failure (code != RESULT_SUCCESS) all other fields MUST be all-zero.
++    struct OracleReply
++    {
++        /// One of the RESULT_* codes above.
++        uint64 code;                     // [0..8)
++
++        /// Number of the block that includes the transaction.
++        uint64 blockNumber;              // [8..16)
++
++        /// That block's timestamp, in seconds since 1970-01-01 UTC (see getBlockDateAndTime).
++        uint64 blockTimestamp;           // [16..24)
++
++        /// Position of the transaction in the block.
++        uint64 transactionIndex;         // [24..32)
++
++        /// Hash of that block (32-byte big-endian), tying the answer to one history.
++        Array<uint8, 32> blockHash;      // [32..64)
++
++        /// Sender: 20-byte address right-aligned (upper 12 bytes zero).
++        Array<uint8, 32> from;           // [64..96)
++
++        /// Recipient: 20-byte address right-aligned; all zero for a contract creation.
++        Array<uint8, 32> to;             // [96..128)
++
++        /// Native value sent (wei), uint256 big-endian.
++        Array<uint8, 32> value;          // [128..160)
++
++        /// Sender's nonce for this transaction.
++        uint64 nonce;                    // [160..168)
++
++        /// STATUS_SUCCESS (1) or STATUS_REVERTED (0).
++        uint64 status;                   // [168..176)
++
++        /// EIP-2718 transaction type: 0 legacy, 1 access list, 2 EIP-1559, 3 blob, 4 EIP-7702.
++        uint64 txType;                   // [176..184)
++
++        /// Number of logs in the receipt (valid logIndex values for EvmLogRead are 0..logCount-1).
++        uint64 logCount;                 // [184..192)
++    };
++
++    /// Return query fee. Cross-chain reads are comparatively expensive (same as EvmLogRead).
++    static sint64 getQueryFee(const OracleQuery& query)
++    {
++        return 1000;
++    }
++
++    //-------------------------------------------------------------------------
++    // Optional: convenience features for contracts using the oracle interface
++
++    /// True if the transaction was found, finalized and succeeded.
++    static bool replyIsValid(const OracleReply& reply)
++    {
++        return reply.code == RESULT_SUCCESS && reply.status == STATUS_SUCCESS;
++    }
++
++    /// True if a failed reply should be retried later rather than treated as final.
++    static bool replyIsRetriable(const OracleReply& reply)
++    {
++        return reply.code == RESULT_TX_NOT_FOUND || reply.code == RESULT_TX_NOT_FINALIZED;
++    }
++
++    /// Block time as a QPI DateAndTime (UTC), to compare with qpi.now() or a stored DateAndTime.
++    /// Returns false if the reply is not a success or the time is out of DateAndTime's range.
++    static bool getBlockDateAndTime(const OracleReply& reply, DateAndTime& out)
++    {
++        out = DateAndTime(1970, 1, 1, 0, 0, 0);
++        return reply.code == RESULT_SUCCESS && out.add(0, 0, 0, 0, 0, (sint64)reply.blockTimestamp);
++    }
++};
+diff --git a/test/oracle_engine.cpp b/test/oracle_engine.cpp
+index 7ac6ab2..243f8e2 100644
+--- a/test/oracle_engine.cpp
++++ b/test/oracle_engine.cpp
+@@ -2149,7 +2149,7 @@ TEST(QubicLogReadOracle, DeterministicQueryBytes)
+ }
+ 
+ // --- EvmCallRead oracle interface (generic cross-chain read of EVM state at a finalized block) ---
+-// BEGIN EvmCallRead / UtxoTxRead / ContentRead interface tests (self-contained: also built on Linux
++// BEGIN EvmCallRead / UtxoTxRead / ContentRead / EvmTxRead interface tests (self-contained: also built on Linux
+ // by the qubic-oracle-designs check, which compiles only this block against the interface registry)
+ 
+ // Sizes and offsets are pinned so the query bytes and the reply digest stay canonical.
+@@ -2508,4 +2508,157 @@ TEST(ContentReadOracle, DeterministicQueryBytes)
+ 	EXPECT_EQ(compareMem(&a, &b, sizeof(C::OracleQuery)), 0);
+ }
+ 
+-// END EvmCallRead / UtxoTxRead / ContentRead interface tests
++// --- EvmTxRead oracle interface (one finalized EVM transaction: block, time, sender, status) ---
++
++TEST(EvmTxReadOracle, DataContract)
++{
++	using E = OI::EvmTxRead;
++
++	// registered at index 8
++	EXPECT_EQ(E::oracleInterfaceIndex, 8u);
++	EXPECT_LT(E::oracleInterfaceIndex, OI::oracleInterfacesCount);
++
++	// fits within transaction limits
++	EXPECT_LE(sizeof(E::OracleQuery), (size_t)MAX_ORACLE_QUERY_SIZE);
++	EXPECT_LE(sizeof(E::OracleReply), (size_t)MAX_ORACLE_REPLY_SIZE);
++
++	// pinned sizes and offsets (no padding holes)
++	EXPECT_EQ(sizeof(E::OracleQuery), 40u);
++	EXPECT_EQ(sizeof(E::OracleReply), 192u);
++	EXPECT_EQ(offsetof(E::OracleQuery, txHash), 8u);
++	EXPECT_EQ(offsetof(E::OracleReply, blockNumber), 8u);
++	EXPECT_EQ(offsetof(E::OracleReply, blockTimestamp), 16u);
++	EXPECT_EQ(offsetof(E::OracleReply, transactionIndex), 24u);
++	EXPECT_EQ(offsetof(E::OracleReply, blockHash), 32u);
++	EXPECT_EQ(offsetof(E::OracleReply, from), 64u);
++	EXPECT_EQ(offsetof(E::OracleReply, to), 96u);
++	EXPECT_EQ(offsetof(E::OracleReply, value), 128u);
++	EXPECT_EQ(offsetof(E::OracleReply, nonce), 160u);
++	EXPECT_EQ(offsetof(E::OracleReply, status), 168u);
++	EXPECT_EQ(offsetof(E::OracleReply, txType), 176u);
++	EXPECT_EQ(offsetof(E::OracleReply, logCount), 184u);
++
++	// registry size table matches the actual structs
++	EXPECT_EQ(OI::oracleInterfaces[E::oracleInterfaceIndex].querySize, sizeof(E::OracleQuery));
++	EXPECT_EQ(OI::oracleInterfaces[E::oracleInterfaceIndex].replySize, sizeof(E::OracleReply));
++}
++
++TEST(EvmTxReadOracle, QueryFeeAndChains)
++{
++	using E = OI::EvmTxRead;
++
++	EXPECT_TRUE(OI::initOracleInterfaces());
++
++	E::OracleQuery query{};
++	query.chainId = E::ChainId::ethereum;
++	EXPECT_EQ(E::getQueryFee(query), 1000);
++	EXPECT_GE(E::getQueryFee(query), MIN_ORACLE_QUERY_FEE);
++	auto* feeFunc = OI::getOracleQueryFeeFunc[E::oracleInterfaceIndex];
++	ASSERT_NE(feeFunc, nullptr);
++	EXPECT_EQ(feeFunc(&query), 1000);
++
++	// the same chains as EvmLogRead, with the same ids, so a log and its transaction use one chainId
++	const QPI::uint64 chains[] = { 1, 10, 56, 137, 250, 8453, 43114, 42161, 11155111 };
++	for (QPI::uint64 c : chains)
++	{
++		EXPECT_TRUE(E::isSupportedChain(c));
++		EXPECT_EQ(E::isSupportedChain(c), OI::EvmLogRead::isSupportedChain(c));
++	}
++	EXPECT_FALSE(E::isSupportedChain(0));
++	EXPECT_FALSE(E::isSupportedChain(2));
++	EXPECT_FALSE(E::isSupportedChain(999999));
++}
++
++TEST(EvmTxReadOracle, ResultCodesAndReplyHelpers)
++{
++	using E = OI::EvmTxRead;
++
++	EXPECT_EQ(E::RESULT_SUCCESS, 0u);
++	const QPI::uint64 failureCodes[] = {
++		E::RESULT_BAD_QUERY, E::RESULT_CHAIN_UNSUPPORTED, E::RESULT_TX_NOT_FOUND, E::RESULT_TX_NOT_FINALIZED,
++	};
++	const unsigned n = sizeof(failureCodes) / sizeof(failureCodes[0]);
++	for (unsigned i = 0; i < n; ++i)
++	{
++		EXPECT_NE(failureCodes[i], E::RESULT_SUCCESS);
++		for (unsigned j = i + 1; j < n; ++j)
++			EXPECT_NE(failureCodes[i], failureCodes[j]);
++	}
++
++	E::OracleReply reply{};
++	reply.code = E::RESULT_SUCCESS;
++	reply.status = E::STATUS_SUCCESS;
++	EXPECT_TRUE(E::replyIsValid(reply));
++	reply.status = E::STATUS_REVERTED;          // a reverted tx is a final answer, but not a usable payment
++	EXPECT_FALSE(E::replyIsValid(reply));
++	EXPECT_FALSE(E::replyIsRetriable(reply));
++	reply.status = E::STATUS_SUCCESS;
++	reply.code = E::RESULT_TX_NOT_FOUND;
++	EXPECT_FALSE(E::replyIsValid(reply));
++	EXPECT_TRUE(E::replyIsRetriable(reply));
++	reply.code = E::RESULT_TX_NOT_FINALIZED;
++	EXPECT_TRUE(E::replyIsRetriable(reply));
++	reply.code = E::RESULT_CHAIN_UNSUPPORTED;
++	EXPECT_FALSE(E::replyIsRetriable(reply));
++}
++
++// The block time converts to a QPI DateAndTime that compares with qpi.now()-style values.
++TEST(EvmTxReadOracle, BlockTimeAsDateAndTime)
++{
++	using E = OI::EvmTxRead;
++
++	E::OracleReply reply{};
++	reply.code = E::RESULT_SUCCESS;
++	QPI::DateAndTime t;
++
++	reply.blockTimestamp = 1700000000;              // 2023-11-14 22:13:20 UTC
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_EQ(t.getYear(), 2023);
++	EXPECT_EQ(t.getMonth(), 11);
++	EXPECT_EQ(t.getDay(), 14);
++	EXPECT_EQ(t.getHour(), 22);
++	EXPECT_EQ(t.getMinute(), 13);
++	EXPECT_EQ(t.getSecond(), 20);
++	EXPECT_TRUE(t == QPI::DateAndTime(2023, 11, 14, 22, 13, 20));
++
++	reply.blockTimestamp = 1709251199;              // 2024-02-29 23:59:59 UTC (leap day)
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_TRUE(t == QPI::DateAndTime(2024, 2, 29, 23, 59, 59));
++	QPI::DateAndTime opened(2024, 3, 1, 0, 0, 0);
++	EXPECT_TRUE(t < opened);                        // a payment one second before an order opened
++
++	reply.blockTimestamp = 0;
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_TRUE(t == QPI::DateAndTime(1970, 1, 1, 0, 0, 0));
++
++	reply.blockTimestamp = 1700000000;
++	reply.code = E::RESULT_TX_NOT_FINALIZED;        // no time from a failed reply
++	EXPECT_FALSE(E::getBlockDateAndTime(reply, t));
++}
++
++TEST(EvmTxReadOracle, DeterministicQueryBytes)
++{
++	using E = OI::EvmTxRead;
++
++	auto build = [](E::OracleQuery& q)
++	{
++		setMem(&q, sizeof(q), 0);
++		q.chainId = E::ChainId::ethereum;
++		for (QPI::uint64 i = 0; i < 32; ++i)
++			q.txHash.set(i, (QPI::uint8)(0x40 + i));
++	};
++
++	E::OracleQuery a, b;
++	build(a);
++	build(b);
++	EXPECT_EQ(compareMem(&a, &b, sizeof(E::OracleQuery)), 0);
++
++	unsigned char buffer[MAX_ORACLE_QUERY_SIZE];
++	setMem(buffer, sizeof(buffer), 0);
++	copyMem(buffer, &a, sizeof(a));
++	E::OracleQuery roundtrip{};
++	copyMem(&roundtrip, buffer, sizeof(roundtrip));
++	EXPECT_EQ(compareMem(&a, &roundtrip, sizeof(E::OracleQuery)), 0);
++}
++
++// END EvmCallRead / UtxoTxRead / ContentRead / EvmTxRead interface tests
+-- 
+2.43.0
+

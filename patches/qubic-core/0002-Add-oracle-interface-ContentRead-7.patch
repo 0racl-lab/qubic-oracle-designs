@@ -1,7 +1,7 @@
 From 72e1a169d5c604f6a62c4706be88a77059d99698 Mon Sep 17 00:00:00 2001
 From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 17:41:59 +0000
-Subject: [PATCH 2/2] Add oracle interface ContentRead (7)
+Subject: [PATCH 2/3] Add oracle interface ContentRead (7)
 
 Read a file named by the SHA-256 of its bytes: its size, a byte range (up to
 512 bytes) or one JSON field in RFC 8785 canonical form. The locator (IPFS CID

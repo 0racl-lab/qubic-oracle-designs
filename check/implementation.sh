@@ -1,7 +1,7 @@
 #!/bin/bash
 # Apply the implementation patch series to clean upstream checkouts and test them:
-#   qubic/core            patches/qubic-core/*.patch      (EvmCallRead, UtxoTxRead, ContentRead interfaces + tests)
-#   qubic/oracle-machine  patches/oracle-machine/*.patch  (read_evm_call, read_utxo_tx, read_content services)
+#   qubic/core            patches/qubic-core/*.patch      (EvmCallRead, UtxoTxRead, ContentRead, EvmTxRead interfaces + tests)
+#   qubic/oracle-machine  patches/oracle-machine/*.patch  (read_evm_call, read_utxo_tx, read_content, read_evm_tx services)
 #
 # Steps: clone both repos at the commits the patches were made against, apply the patches, run
 # contract-verify on the new headers (if installed), build and run the new core tests on Linux,
@@ -32,13 +32,13 @@ fetch https://github.com/qubic/core.git "$WORK/core" "$CORE_REF"
 apply_series "$WORK/core" "$ROOT/patches/qubic-core"
 
 # the headers in oracle_interfaces/ must be exactly what the patch adds to core
-for f in EvmCallRead UtxoTxRead ContentRead; do
+for f in EvmCallRead UtxoTxRead ContentRead EvmTxRead; do
   cmp -s "oracle_interfaces/$f.h" "$WORK/core/src/oracle_interfaces/$f.h" \
     || { echo "oracle_interfaces/$f.h differs from the patched core header"; exit 1; }
 done
 
 if command -v contractverify >/dev/null 2>&1; then
-  for f in EvmCallRead UtxoTxRead ContentRead; do
+  for f in EvmCallRead UtxoTxRead ContentRead EvmTxRead; do
     printf '%s: ' "$f"; contractverify --oi "$WORK/core/src/oracle_interfaces/$f.h" | tail -1
   done
 else
@@ -73,8 +73,13 @@ python3 "$O/read_utxo_tx/test/mock_utxo_node.py" --port 18748 --lag 45 & PIDS+=(
 python3 "$O/read_content/test/mock_gateway.py" --port 18845 & PIDS+=($!)
 python3 "$O/read_content/test/mock_gateway.py" --port 18846 --tamper & PIDS+=($!)
 python3 "$O/read_content/test/mock_gateway.py" --port 18847 --broken & PIDS+=($!)
+python3 "$O/read_evm_tx/test/mock_evm_rpc.py" --port 18945 & PIDS+=($!)
+python3 "$O/read_evm_tx/test/mock_evm_rpc.py" --port 18946 & PIDS+=($!)
+python3 "$O/read_evm_tx/test/mock_evm_rpc.py" --port 18947 --tamper & PIDS+=($!)
+python3 "$O/read_evm_tx/test/mock_evm_rpc.py" --port 18948 --lag & PIDS+=($!)
 sleep 1
 printf -- '-- read_evm_call: '; python3 "$O/read_evm_call/test/selftest.py" 2>/dev/null | tail -1
 printf -- '-- read_utxo_tx (mock Dogecoin nodes): '; python3 "$O/read_utxo_tx/test/selftest.py" 2>/dev/null | tail -1
 printf -- '-- read_content (mock gateways): '; python3 "$O/read_content/test/selftest.py" 2>/dev/null | tail -1
+printf -- '-- read_evm_tx: '; python3 "$O/read_evm_tx/test/selftest.py" 2>/dev/null | tail -1
 echo "== all implementation checks passed"

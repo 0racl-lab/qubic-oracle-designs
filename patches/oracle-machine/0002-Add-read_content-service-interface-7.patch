@@ -1,7 +1,7 @@
 From d6f2912ce32587c58eccee3e054fa09676392d24 Mon Sep 17 00:00:00 2001
 From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 17:41:59 +0000
-Subject: [PATCH 2/2] Add read_content service (interface 7)
+Subject: [PATCH 2/3] Add read_content service (interface 7)
 
 Fetches a file from the operator's IPFS gateways, Arweave gateways or content
 mirrors, keeps only bytes whose SHA-256 matches the query, and returns the

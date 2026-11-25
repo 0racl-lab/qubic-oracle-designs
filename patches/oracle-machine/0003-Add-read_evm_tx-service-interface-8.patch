@@ -1,0 +1,960 @@
+From fb3cf675dd689b72b56f97c0682fa21257267996 Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:15:19 +0000
+Subject: [PATCH 3/3] Add read_evm_tx service (interface 8)
+
+One finalized EVM transaction: block number, block hash, block timestamp,
+position, sender, recipient, native value, nonce, type, status and log
+count. The sibling of read_evm_log: that returns what a transaction
+emitted, this returns when and by whom, so a contract can accept a token
+transfer only if it was made after a given moment.
+
+Per endpoint the transaction, receipt and block (fetched by the hash the
+receipt names) must tell one consistent story; every endpoint must agree
+byte-for-byte and report the block finalized, otherwise the service
+abstains. A reverted transaction is a final result (status 0), not "not
+finalized". Stdlib-only Python with a mock node and a 33-check selftest.
+Node config, docker-compose and example_env register the slot (port 9010)
+and reuse EVM_RPC_URLS_<chainId>.
+Requires the matching qubic/core interface (EvmTxRead.h).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ docker/docker-compose.yml                     |  15 +
+ example_env                                   |   6 +
+ libs/om_common/include/om_common/config.h     |   4 +
+ .../include/om_common/default_config.h        |   1 +
+ libs/om_common/src/config.cpp                 |  16 +
+ oracles/CMakeLists.txt                        |   1 +
+ oracles/read_evm_tx/CMakeLists.txt            |   4 +
+ oracles/read_evm_tx/README.md                 |  95 ++++++
+ oracles/read_evm_tx/read_evm_tx_service.py    | 319 ++++++++++++++++++
+ oracles/read_evm_tx/test/live_check.py        |  51 +++
+ oracles/read_evm_tx/test/mock_evm_rpc.py      | 151 +++++++++
+ oracles/read_evm_tx/test/selftest.py          | 144 ++++++++
+ 12 files changed, 807 insertions(+)
+ create mode 100644 oracles/read_evm_tx/CMakeLists.txt
+ create mode 100644 oracles/read_evm_tx/README.md
+ create mode 100644 oracles/read_evm_tx/read_evm_tx_service.py
+ create mode 100755 oracles/read_evm_tx/test/live_check.py
+ create mode 100755 oracles/read_evm_tx/test/mock_evm_rpc.py
+ create mode 100755 oracles/read_evm_tx/test/selftest.py
+
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+index 32d3475..51ec491 100644
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -117,6 +117,21 @@ services:
+     networks:
+       - oracle-net
+ 
++# Read EVM Tx Oracle service (one finalized EVM transaction: block, timestamp, sender, status)
++  read-evm-tx-service:
++    image: oracle-machine:latest
++    container_name: read-evm-tx-service
++    volumes:
++      - ./logs:/opt/qubic/oracle-machine/logs
++    env_file:
++      - docker_local.env
++    user: "${HOST_UID}:${HOST_GID}"
++    # No published ports: the OM node reaches this service via the oracle-net service name.
++    restart: unless-stopped
++    command: ["read_evm_tx_service", "--log","/opt/qubic/oracle-machine/logs/read_evm_tx_service.log"]
++    networks:
++      - oracle-net
++
+ # Network config
+ networks:
+   oracle-net:
+diff --git a/example_env b/example_env
+index 2a6f922..cdf5b80 100644
+--- a/example_env
++++ b/example_env
+@@ -74,6 +74,12 @@ export READ_UTXO_TX_SERVICE_PORT=31849
+ export READ_CONTENT_SERVICE_HOST=192.168.1.11
+ export READ_CONTENT_SERVICE_PORT=31850
+ 
++# read_evm_tx Oracle Service (interface index 8): one finalized EVM transaction (block, timestamp,
++# sender, recipient, value, status). Python service: python3 oracles/read_evm_tx/read_evm_tx_service.py
++# Uses the same EVM_RPC_URLS_<chainId> / EVM_MIN_CONFIRMATIONS_<chainId> settings as read_evm_log.
++export READ_EVM_TX_SERVICE_HOST=192.168.1.12
++export READ_EVM_TX_SERVICE_PORT=31851
++
+ # Bob node RPC URL(s) the service reads transaction receipts from, comma-separated. Run your OWN
+ # bob; all configured bobs must return byte-identical receipts or the service abstains.
+ # The URL must include the /qubic RPC path (bob answers JSON-RPC only at POST /qubic).
+diff --git a/libs/om_common/include/om_common/config.h b/libs/om_common/include/om_common/config.h
+index 554b68e..a0657c7 100644
+--- a/libs/om_common/include/om_common/config.h
++++ b/libs/om_common/include/om_common/config.h
+@@ -16,6 +16,7 @@ constexpr const uint32_t READ_QUBIC_LOG_INTERFACE_INDEX = 4;
+ constexpr const uint32_t READ_EVM_CALL_INTERFACE_INDEX = 5;
+ constexpr const uint32_t READ_UTXO_TX_INTERFACE_INDEX = 6;
+ constexpr const uint32_t READ_CONTENT_INTERFACE_INDEX = 7;
++constexpr const uint32_t READ_EVM_TX_INTERFACE_INDEX = 8;
+ constexpr const uint32_t MAX_ORACLE_INTERFACES_SUPPORT = 1024;
+ 
+ // ENVIRONMENT VARIABLE NAMES
+@@ -49,6 +50,9 @@ constexpr const char* READ_UTXO_TX_SERVICE_PORT = "READ_UTXO_TX_SERVICE_PORT";
+ 
+ constexpr const char* READ_CONTENT_SERVICE_HOST = "READ_CONTENT_SERVICE_HOST";
+ constexpr const char* READ_CONTENT_SERVICE_PORT = "READ_CONTENT_SERVICE_PORT";
++
++constexpr const char* READ_EVM_TX_SERVICE_HOST = "READ_EVM_TX_SERVICE_HOST";
++constexpr const char* READ_EVM_TX_SERVICE_PORT = "READ_EVM_TX_SERVICE_PORT";
+ } // namespace ConfigEnv
+ 
+ struct NodeEndpoint
+diff --git a/libs/om_common/include/om_common/default_config.h b/libs/om_common/include/om_common/default_config.h
+index 6976577..d7e306d 100644
+--- a/libs/om_common/include/om_common/default_config.h
++++ b/libs/om_common/include/om_common/default_config.h
+@@ -31,6 +31,7 @@ constexpr InterfaceDefault INTERFACES[] = {
+     {5, "ReadEvmCall", "0.0.0.0", 9007},
+     {6, "ReadUtxoTx", "0.0.0.0", 9008},
+     {7, "ReadContent", "0.0.0.0", 9009},
++    {8, "ReadEvmTx", "0.0.0.0", 9010},
+     // Add more interfaces here
+ };
+ constexpr uint32_t INTERFACE_COUNT = sizeof(INTERFACES) / sizeof(INTERFACES[0]);
+diff --git a/libs/om_common/src/config.cpp b/libs/om_common/src/config.cpp
+index d357eef..a04ec88 100644
+--- a/libs/om_common/src/config.cpp
++++ b/libs/om_common/src/config.cpp
+@@ -210,6 +210,22 @@ void Config::loadFromEnv()
+         _interfaces.push_back(interfaceEndpoint);
+     }
+ 
++    // Read EVM tx interface (index 8) - one finalized EVM transaction: block, timestamp, sender, status
++    {
++        InterfaceEndpoint interfaceEndpoint;
++        interfaceEndpoint.interfaceIndex = READ_EVM_TX_INTERFACE_INDEX;
++        interfaceEndpoint.interfaceName = "ReadEvmTx";
++        getStr(
++            ConfigEnv::READ_EVM_TX_SERVICE_HOST,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].host,
++            interfaceEndpoint.serviceHost);
++        getUint16(
++            ConfigEnv::READ_EVM_TX_SERVICE_PORT,
++            ConfigDefaults::INTERFACES[interfaceEndpoint.interfaceIndex].port,
++            interfaceEndpoint.servicePort);
++        _interfaces.push_back(interfaceEndpoint);
++    }
++
+     print();
+ 
+ }
+diff --git a/oracles/CMakeLists.txt b/oracles/CMakeLists.txt
+index 4df1c88..213487d 100644
+--- a/oracles/CMakeLists.txt
++++ b/oracles/CMakeLists.txt
+@@ -42,4 +42,5 @@ add_subdirectory(read_evm_log)
+ add_subdirectory(read_evm_call)
+ add_subdirectory(read_utxo_tx)
+ add_subdirectory(read_content)
++add_subdirectory(read_evm_tx)
+ 
+diff --git a/oracles/read_evm_tx/CMakeLists.txt b/oracles/read_evm_tx/CMakeLists.txt
+new file mode 100644
+index 0000000..2516370
+--- /dev/null
++++ b/oracles/read_evm_tx/CMakeLists.txt
+@@ -0,0 +1,4 @@
++# Python service - nothing to build; install the script as an executable named like the others.
++install(PROGRAMS read_evm_tx_service.py
++        DESTINATION bin
++        RENAME read_evm_tx_service)
+diff --git a/oracles/read_evm_tx/README.md b/oracles/read_evm_tx/README.md
+new file mode 100644
+index 0000000..30c4eb3
+--- /dev/null
++++ b/oracles/read_evm_tx/README.md
+@@ -0,0 +1,95 @@
++# read_evm_tx oracle service
++
++Generic **EVM transaction &rarr; Qubic** oracle. Given `(chainId, txHash)` it returns where and when a
++**finalized** transaction was included and who sent it: block number, block hash, block timestamp,
++position in the block, sender, recipient, native value, nonce, type, status and number of logs.
++
++It is the sibling of `read_evm_log`: that service returns **what** a transaction emitted (one raw log),
++this one returns **when** and **by whom**. Together they let a Qubic contract accept a token transfer
++only if it was made after a given moment, for example after an order was opened, which a log alone
++cannot show.
++
++Implemented in Python (`read_evm_tx_service.py`, stdlib only), with the same OM node <-> service
++framing and the same `EVM_RPC_URLS_<chainId>` configuration as `read_evm_log`.
++
++## Wire format
++
++Mirrors core's `OI::EvmTxRead` (`src/oracle_interfaces/EvmTxRead.h`, interface index 8).
++
++### Query — 40 bytes
++
++| offset | size | field     | notes                          |
++|-------:|-----:|-----------|--------------------------------|
++| 0      | 8    | `chainId` | uint64 LE                      |
++| 8      | 32   | `txHash`  | transaction hash               |
++
++### Reply — 192 bytes
++
++| offset | size | field              | notes                                                     |
++|-------:|-----:|--------------------|-----------------------------------------------------------|
++| 0      | 8    | `code`             | uint64 LE result code                                     |
++| 8      | 8    | `blockNumber`      | block that includes the transaction                       |
++| 16     | 8    | `blockTimestamp`   | that block's timestamp, seconds since 1970-01-01 UTC      |
++| 24     | 8    | `transactionIndex` | position in the block                                     |
++| 32     | 32   | `blockHash`        | hash of that block                                        |
++| 64     | 32   | `from`             | sender, 20 bytes right-aligned                            |
++| 96     | 32   | `to`               | recipient, 20 bytes right-aligned; all zero for a contract creation |
++| 128    | 32   | `value`            | native value in wei, uint256 big-endian                   |
++| 160    | 8    | `nonce`            | sender's nonce                                            |
++| 168    | 8    | `status`           | 1 success, 0 reverted                                     |
++| 176    | 8    | `txType`           | 0 legacy, 1 access list, 2 EIP-1559, 3 blob, 4 EIP-7702   |
++| 184    | 8    | `logCount`         | logs in the receipt (valid `logIndex` for `read_evm_log`) |
++
++On any non-zero `code`, **all value fields are zero**.
++
++## Result codes
++
++| code | name                | meaning                                                      |
++|-----:|---------------------|--------------------------------------------------------------|
++| 0    | `SUCCESS`           | transaction in a finalized block; check `status`             |
++| 1    | `BAD_QUERY`         | zero tx hash                                                 |
++| 2    | `CHAIN_UNSUPPORTED` | no RPC endpoints configured for `chainId`                    |
++| 3    | `TX_NOT_FOUND`      | no endpoint knows the transaction (retriable)                |
++| 4    | `TX_NOT_FINALIZED`  | pending, or its block is above some endpoint's finalized head (retriable) |
++
++A **reverted transaction is a result**, not a failure: `SUCCESS` with `status = 0`. (`read_evm_log`
++folds reverts into "not finalized"; here a contract can tell "failed" apart from "not there yet".)
++A transport error, inconsistent node data or any provider disagreement is **not** a result code: the
++service abstains (oracle error flag, nothing committed).
++
++## Determinism guarantees
++
++- **Finalized only.** The transaction's block must be at or below the finalized head reported by
++  *every* endpoint (or `latest - EVM_MIN_CONFIRMATIONS_<chainId>` where configured).
++- **One consistent story per endpoint.** The transaction, its receipt and its block must agree on
++  block hash, block number, position and sender; the timestamp comes from the block the receipt
++  names, fetched by hash. Any mismatch makes the service abstain.
++- **Multi-provider byte-agreement** on the normalized result (including "unknown" and "pending");
++  otherwise abstain.
++
++## Config
++
++| env var                           | purpose                                                          |
++|-----------------------------------|------------------------------------------------------------------|
++| `READ_EVM_TX_SERVICE_HOST/PORT`   | interface slot the OM node reaches this service on (default port 9010) |
++| `EVM_RPC_URLS_<chainId>`          | shared with `read_evm_log` (>= 2 providers recommended)          |
++| `EVM_MIN_CONFIRMATIONS_<chainId>` | optional; `latest - N` instead of the `finalized` tag            |
++
++Run: `python3 read_evm_tx_service.py` (Python 3.8+, no third-party packages).
++
++## Tests
++
++```bash
++python3 test/mock_evm_rpc.py --port 18945 &
++python3 test/mock_evm_rpc.py --port 18946 &
++python3 test/mock_evm_rpc.py --port 18947 --tamper &
++python3 test/mock_evm_rpc.py --port 18948 --lag &
++python3 test/selftest.py     # exit 0 = all scenarios pass (33 checks)
++```
++
++Against real endpoints (nothing is sent to Qubic):
++
++```bash
++EVM_RPC_URLS_1=https://ethereum-rpc.publicnode.com,https://eth.llamarpc.com \
++python3 test/live_check.py 1 0x<txHash>
++```
+diff --git a/oracles/read_evm_tx/read_evm_tx_service.py b/oracles/read_evm_tx/read_evm_tx_service.py
+new file mode 100644
+index 0000000..92ddf26
+--- /dev/null
++++ b/oracles/read_evm_tx/read_evm_tx_service.py
+@@ -0,0 +1,319 @@
++#!/usr/bin/env python3
++"""read_evm_tx oracle service (interface index 8): one finalized EVM transaction - when, by whom, status.
++
++Query 40B:  chainId u64 | txHash 32B.
++Reply 192B: code u64 | blockNumber u64 | blockTimestamp u64 | transactionIndex u64 | blockHash 32B |
++            from 32B | to 32B | value 32B (uint256 BE) | nonce u64 | status u64 | txType u64 | logCount u64.
++Only transactions in finalized blocks are answered. Every configured RPC endpoint must agree
++byte-for-byte on the normalized transaction, receipt and block, otherwise the service abstains
++(oracle error flag, no reply payload). A reverted transaction is a final fact: SUCCESS with status 0.
++
++Speaks the OM node <-> service protocol of oracles/core/base_oracle_service.cpp (same framing as
++read_evm_log):
++  query:  header 8B (size LE24 | type=190 | dejavu u32) | OracleMachineQuery 16B | payload 40B
++  reply:  header 8B (size LE24 | type=191 | dejavu=0)   | OracleMachineReply 16B | payload 192B
++
++Env: READ_EVM_TX_SERVICE_PORT (default 9010), EVM_RPC_URLS_<chainId> (comma-separated; the same
++variables as read_evm_log), EVM_MIN_CONFIRMATIONS_<chainId> (optional: latest-N instead of the
++"finalized" tag).
++"""
++
++import json
++import os
++import signal
++import socket
++import socketserver
++import struct
++import sys
++import urllib.error
++import urllib.request
++
++QUERY_SIZE = 40
++REPLY_SIZE = 192
++OM_QUERY_TYPE = 190
++OM_REPLY_TYPE = 191
++MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024
++RPC_TIMEOUT_S = 10
++SOCKET_TIMEOUT_S = 600  # mirrors core's BaseOracleService::TIME_OUT_MS
++MAX_FRAME_BYTES = 4096  # larger frame means corrupt framing, not an unrelated message
++
++# Result codes (mirror core's OI::EvmTxRead)
++SUCCESS = 0
++BAD_QUERY = 1
++CHAIN_UNSUPPORTED = 2
++TX_NOT_FOUND = 3
++TX_NOT_FINALIZED = 4
++
++# Oracle error flags (mirror core's network_messages/common_def.h)
++NO_ERROR = 0x0
++ORACLE_UNAVAIL = 0x2
++INVALID_ARG = 0x10
++
++SUPPORTED_CHAIN_IDS = [1, 10, 56, 137, 250, 8453, 43114, 42161, 11155111]
++INTERFACE_INDEX = 8
++
++
++class Abstain(Exception):
++    """Transport error, malformed or inconsistent data, or provider disagreement: commit nothing."""
++
++
++def hexb(s, size=None):
++    """0x-prefixed hex string -> bytes (optionally of an exact size); raises on anything else."""
++    if not isinstance(s, str) or not s.startswith("0x") or len(s) % 2:
++        raise Abstain(f"expected 0x-prefixed even-length hex, got {s!r}")
++    try:
++        b = bytes.fromhex(s[2:])
++    except ValueError as e:
++        raise Abstain(f"bad hex: {e}") from e
++    if size is not None and len(b) != size:
++        raise Abstain(f"expected {size} bytes, got {len(b)}")
++    return b
++
++
++def qty(s):
++    """JSON-RPC quantity (0x-prefixed hex, no leading zeros required) -> int."""
++    if not isinstance(s, str) or not s.startswith("0x") or len(s) < 3:
++        raise Abstain(f"expected hex quantity, got {s!r}")
++    try:
++        return int(s, 16)
++    except ValueError as e:
++        raise Abstain(f"bad quantity: {e}") from e
++
++
++def load_chains():
++    chains = {}
++    for chain_id in SUPPORTED_CHAIN_IDS:
++        urls = os.environ.get(f"EVM_RPC_URLS_{chain_id}", "")
++        endpoints = [u.strip() for u in urls.split(",") if u.strip()]
++        if not endpoints:
++            continue
++        conf = os.environ.get(f"EVM_MIN_CONFIRMATIONS_{chain_id}", "")
++        chains[chain_id] = {
++            "endpoints": endpoints,
++            "min_confirmations": max(0, int(conf)) if conf else 0,
++        }
++    return chains
++
++
++def rpc(endpoint, method, params):
++    """One JSON-RPC call; returns "result" (may be None), raises Abstain on any error."""
++    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
++    req = urllib.request.Request(endpoint, data=body, headers={"Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(req, timeout=RPC_TIMEOUT_S) as resp:
++            raw = resp.read(MAX_RPC_RESPONSE_BYTES + 1)
++    except Exception as e:
++        raise Abstain(f"transport: {e}") from e
++    if len(raw) > MAX_RPC_RESPONSE_BYTES:
++        raise Abstain("response too large")
++    try:
++        reply = json.loads(raw)
++    except ValueError as e:
++        raise Abstain(f"bad json: {e}") from e
++    if not isinstance(reply, dict) or "result" not in reply or reply.get("error"):
++        raise Abstain(f"rpc error: {reply.get('error') if isinstance(reply, dict) else reply!r}")
++    return reply["result"]
++
++
++def finalized_head(endpoint, chain):
++    if chain["min_confirmations"]:
++        latest = rpc(endpoint, "eth_getBlockByNumber", ["latest", False])
++        return qty(latest["number"]) - chain["min_confirmations"]
++    block = rpc(endpoint, "eth_getBlockByNumber", ["finalized", False])
++    return qty(block["number"])
++
++
++def address_word(s):
++    """20-byte address -> 32-byte word, right-aligned."""
++    return bytes(12) + hexb(s, 20)
++
++
++def read_tx(endpoint, tx_hash_hex):
++    """Normalized view of one transaction from one endpoint.
++    Returns None (unknown), "pending", or a dict of the reply fields; raises Abstain on inconsistency."""
++    tx = rpc(endpoint, "eth_getTransactionByHash", [tx_hash_hex])
++    if tx is None:
++        return None
++    if not isinstance(tx, dict) or tx.get("hash", "").lower() != tx_hash_hex:
++        raise Abstain("endpoint returned a different transaction")
++    if tx.get("blockHash") is None or tx.get("blockNumber") is None:
++        return "pending"
++    receipt = rpc(endpoint, "eth_getTransactionReceipt", [tx_hash_hex])
++    if not isinstance(receipt, dict):
++        raise Abstain("mined transaction without a receipt")
++    block_hash = hexb(tx["blockHash"], 32)
++    block_number = qty(tx["blockNumber"])
++    tx_index = qty(tx["transactionIndex"])
++    if (hexb(receipt["blockHash"], 32) != block_hash or qty(receipt["blockNumber"]) != block_number
++            or qty(receipt["transactionIndex"]) != tx_index or hexb(receipt["from"], 20) != hexb(tx["from"], 20)):
++        raise Abstain("transaction and receipt disagree")
++    if "status" not in receipt:
++        raise Abstain("receipt without status (pre-Byzantium)")
++    status = qty(receipt["status"])
++    if status not in (0, 1):
++        raise Abstain(f"unexpected status {status}")
++    block = rpc(endpoint, "eth_getBlockByHash", ["0x" + block_hash.hex(), False])
++    if not isinstance(block, dict) or hexb(block["hash"], 32) != block_hash or qty(block["number"]) != block_number:
++        raise Abstain("block does not match the receipt")
++    value = qty(tx["value"])
++    if value >= 1 << 256:
++        raise Abstain("value out of range")
++    return {
++        "blockNumber": block_number,
++        "blockTimestamp": qty(block["timestamp"]),
++        "transactionIndex": tx_index,
++        "blockHash": block_hash,
++        "from": address_word(tx["from"]),
++        "to": bytes(32) if tx.get("to") is None else address_word(tx["to"]),
++        "value": value.to_bytes(32, "big"),
++        "nonce": qty(tx["nonce"]),
++        "status": status,
++        "txType": qty(tx.get("type", "0x0")),
++        "logCount": len(receipt["logs"]),
++    }
++
++
++def read_agreed(chain, tx_hash_hex):
++    """(code, fields) agreed by every endpoint, or raises Abstain."""
++    agreed = None
++    finalized = True
++    for i, endpoint in enumerate(chain["endpoints"]):
++        one = read_tx(endpoint, tx_hash_hex)
++        if i == 0:
++            agreed = one
++        elif one != agreed:
++            raise Abstain("provider disagreement")
++        if isinstance(one, dict) and one["blockNumber"] > finalized_head(endpoint, chain):
++            finalized = False
++    if agreed is None:
++        return TX_NOT_FOUND, None
++    if agreed == "pending" or not finalized:
++        return TX_NOT_FINALIZED, None
++    return SUCCESS, agreed
++
++
++def code_reply(code):
++    return struct.pack("<Q", code) + bytes(REPLY_SIZE - 8)
++
++
++def encode_reply(f):
++    reply = struct.pack("<QQQQ", SUCCESS, f["blockNumber"], f["blockTimestamp"], f["transactionIndex"])
++    reply += f["blockHash"] + f["from"] + f["to"] + f["value"]
++    reply += struct.pack("<QQQQ", f["nonce"], f["status"], f["txType"], f["logCount"])
++    assert len(reply) == REPLY_SIZE
++    return reply
++
++
++def handle_query(chains, payload):
++    """40B query payload -> (errorFlags, 192B reply payload). Abstains via non-zero flags."""
++    if len(payload) != QUERY_SIZE:
++        return INVALID_ARG, bytes(REPLY_SIZE)
++    chain_id, tx_hash = struct.unpack("<Q32s", payload)
++    if tx_hash == bytes(32):
++        return NO_ERROR, code_reply(BAD_QUERY)
++    if chain_id not in chains:
++        return NO_ERROR, code_reply(CHAIN_UNSUPPORTED)
++    try:
++        code, fields = read_agreed(chains[chain_id], "0x" + tx_hash.hex())
++        if code != SUCCESS:
++            return NO_ERROR, code_reply(code)
++        if max(fields["blockNumber"], fields["blockTimestamp"], fields["transactionIndex"],
++               fields["nonce"], fields["txType"]) >= 1 << 64:
++            raise Abstain("field does not fit in 64 bits")
++        return NO_ERROR, encode_reply(fields)
++    except Exception as e:  # Abstain, or a malformed field (KeyError/TypeError) from a provider
++        print(f"[ReadEvmTx] abstain: {e}", file=sys.stderr)
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++
++def recv_exact(sock, n):
++    buf = b""
++    while len(buf) < n:
++        chunk = sock.recv(n - len(buf))
++        if not chunk:
++            return None
++        buf += chunk
++    return buf
++
++
++class Handler(socketserver.BaseRequestHandler):
++    def setup(self):
++        self.request.settimeout(SOCKET_TIMEOUT_S)
++
++    def handle(self):
++        try:
++            self.serve()
++        except socket.timeout:
++            return  # idle too long; the node reconnects
++
++    def serve(self):
++        while True:
++            header = recv_exact(self.request, 8)
++            if header is None:
++                return
++            size = header[0] | (header[1] << 8) | (header[2] << 16)
++            msg_type = header[3]
++            if size < 8 or size > MAX_FRAME_BYTES:
++                return  # corrupt framing: cannot resync, drop the connection
++            body = recv_exact(self.request, size - 8)
++            if body is None:
++                return
++            if msg_type != OM_QUERY_TYPE or len(body) != 16 + QUERY_SIZE:
++                continue  # skip unrelated frames
++            query_id, interface_index = struct.unpack("<QI", body[:12])
++            if interface_index != INTERFACE_INDEX:
++                continue  # not our interface (misrouted config)
++            try:
++                flags, reply_payload = handle_query(self.server.chains, body[16:])
++            except Exception as e:  # structural backstop: never kill the OM connection
++                print(f"[ReadEvmTx] abstain (unexpected): {e}", file=sys.stderr)
++                flags, reply_payload = ORACLE_UNAVAIL, bytes(REPLY_SIZE)
++
++            reply_size = 8 + 16 + REPLY_SIZE
++            packet = bytes([reply_size & 0xFF, (reply_size >> 8) & 0xFF,
++                            (reply_size >> 16) & 0xFF, OM_REPLY_TYPE]) + bytes(4)
++            packet += struct.pack("<QH6x", query_id, flags)
++            packet += reply_payload
++            self.request.sendall(packet)
++
++
++class Server(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++def main():
++    args = sys.argv[1:]
++    if args[:1] == ["--log"] and len(args) == 2:
++        log = open(args[1], "a", buffering=1)
++        sys.stdout = sys.stderr = log
++    elif args:
++        print(f"usage: {sys.argv[0]} [--log FILE]")
++        return 0 if args[:1] == ["--help"] else 1
++
++    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    chains = load_chains()
++    if not chains:
++        print("No chains configured! Set EVM_RPC_URLS_<chainId>.", file=sys.stderr)
++        return 1
++    port = int(os.environ.get("READ_EVM_TX_SERVICE_PORT", "9010"))
++    for chain_id, chain in chains.items():
++        finality = (f"{chain['min_confirmations']} confirmations"
++                    if chain["min_confirmations"] else '"finalized" tag')
++        print(f"[ReadEvmTx] chain {chain_id}: {len(chain['endpoints'])} endpoint(s), {finality}")
++    server = Server(("0.0.0.0", port), Handler)
++    server.chains = chains
++    print(f"[ReadEvmTx] listening on {port}")
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
++        print("[ReadEvmTx] shutdown")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_evm_tx/test/live_check.py b/oracles/read_evm_tx/test/live_check.py
+new file mode 100755
+index 0000000..0a534d8
+--- /dev/null
++++ b/oracles/read_evm_tx/test/live_check.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Run one real EvmTxRead query through the service logic against live RPC endpoints.
++
++    EVM_RPC_URLS_1=https://ethereum-rpc.publicnode.com,https://eth.llamarpc.com \
++    python3 test/live_check.py 1 0x<txHash>
++
++Prints the decoded reply. Nothing is sent to Qubic.
++"""
++
++import argparse
++import datetime
++import os
++import struct
++import sys
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++import read_evm_tx_service as svc
++
++NAMES = {0: "SUCCESS", 1: "BAD_QUERY", 2: "CHAIN_UNSUPPORTED", 3: "TX_NOT_FOUND", 4: "TX_NOT_FINALIZED"}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("chain", type=int)
++    p.add_argument("tx")
++    a = p.parse_args()
++    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++    chains = svc.load_chains()
++    if a.chain not in chains:
++        print(f"set EVM_RPC_URLS_{a.chain}")
++        return 1
++    tx = bytes.fromhex(a.tx[2:] if a.tx.startswith("0x") else a.tx)
++    flags, r = svc.handle_query(chains, struct.pack("<Q32s", a.chain, tx))
++    if flags:
++        print(f"abstained (flags {flags:#x}): see the message above")
++        return 2
++    code = struct.unpack("<Q", r[:8])[0]
++    print(f"code {code} {NAMES.get(code, '?')}")
++    if code == 0:
++        number, ts, index = struct.unpack("<QQQ", r[8:32])
++        nonce, status, typ, logs = struct.unpack("<QQQQ", r[160:192])
++        when = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat()
++        print(f"block {number} (0x{r[32:64].hex()}) at {ts} = {when}, index {index}")
++        print(f"from 0x{r[76:96].hex()}  to 0x{r[108:128].hex()}  value {int.from_bytes(r[128:160], 'big')} wei")
++        print(f"nonce {nonce}  status {status}  type {typ}  logs {logs}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/oracles/read_evm_tx/test/mock_evm_rpc.py b/oracles/read_evm_tx/test/mock_evm_rpc.py
+new file mode 100755
+index 0000000..02c6b7c
+--- /dev/null
++++ b/oracles/read_evm_tx/test/mock_evm_rpc.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++"""Minimal mock EVM JSON-RPC server for the read_evm_tx oracle service selftest.
++
++Serves eth_getBlockByNumber, eth_getBlockByHash, eth_getTransactionByHash and
++eth_getTransactionReceipt for a handful of fixed transactions. Run one instance per fake
++"provider"; --tamper shifts one block timestamp by a second (provider disagreement), --lag makes
++the node one that has not seen the newest block yet.
++
++Usage: mock_evm_rpc.py --port 18945 [--tamper | --lag]
++"""
++
++import argparse
++import json
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++FINALIZED = 0x1FF
++LATEST = 0x210
++T0 = 0x64000000                      # timestamp of block 0x100
++
++BLOCKS = {                           # number -> (hash, timestamp)
++    0x100: ("0x" + "b1" * 32, T0),
++    0x101: ("0x" + "b2" * 32, T0 + 12),
++    0x180: ("0x" + "b8" * 32, T0 + 0x80 * 12),    # finalized, but eth_getBlockByHash won't return it
++    0x205: ("0x" + "b5" * 32, T0 + 0x105 * 12),   # above the finalized head
++    FINALIZED: ("0x" + "bf" * 32, T0 + 0xFF * 12),
++}
++
++SENDER = "0x" + "5e" * 20
++TOKEN = "0x" + "a0" * 20
++
++
++def h(c):
++    return "0x" + c * 32
++
++
++TX_OK = h("01")          # successful token transfer, finalized
++TX_REVERTED = h("02")    # reverted, finalized
++TX_PENDING = h("03")     # in the mempool
++TX_RECENT = h("04")      # mined above the finalized head
++TX_CREATE = h("05")      # contract creation, legacy (no "type" field), large value
++TX_NO_RECEIPT = h("06")  # mined but the node has no receipt
++TX_MISMATCH = h("07")    # receipt names another block
++TX_BLOCK_GONE = h("08")  # receipt's block cannot be fetched by hash
++
++# hash -> (block number or None, tx index, to, value, nonce, type or None, status, logs)
++TXS = {
++    TX_OK: (0x100, 3, TOKEN, 0, 7, "0x2", 1, 1),
++    TX_REVERTED: (0x101, 0, TOKEN, 0, 8, "0x2", 0, 0),
++    TX_PENDING: (None, None, TOKEN, 0, 9, "0x2", None, 0),
++    TX_RECENT: (0x205, 1, TOKEN, 0, 10, "0x2", 1, 2),
++    TX_CREATE: (0x100, 4, None, 5 * 10**18, 0, None, 1, 0),
++    TX_NO_RECEIPT: (0x100, 5, TOKEN, 0, 11, "0x2", 1, 0),
++    TX_MISMATCH: (0x100, 6, TOKEN, 0, 12, "0x2", 1, 0),
++    TX_BLOCK_GONE: (0x180, 2, TOKEN, 0, 13, "0x2", 1, 0),
++}
++
++
++class Handler(BaseHTTPRequestHandler):
++    tamper = False
++    lag = False
++
++    def log_message(self, fmt, *args):  # quiet
++        pass
++
++    def block(self, number):
++        if number not in BLOCKS or (self.lag and number > FINALIZED):
++            return None
++        bh, t = BLOCKS[number]
++        if self.tamper and number == 0x100:
++            t += 1
++        return {"number": hex(number), "hash": bh, "timestamp": hex(t), "parentHash": "0x" + "00" * 32}
++
++    def tx(self, txh):
++        if txh not in TXS:
++            return None
++        number, index, to, value, nonce, typ, _, _ = TXS[txh]
++        if self.lag and number is not None and number > FINALIZED:
++            return None                                  # this node hasn't seen the block yet
++        t = {"hash": txh, "from": SENDER, "to": to, "value": hex(value), "nonce": hex(nonce),
++             "blockNumber": None if number is None else hex(number),
++             "blockHash": None if number is None else BLOCKS[number][0],
++             "transactionIndex": None if index is None else hex(index), "input": "0x"}
++        if typ is not None:
++            t["type"] = typ
++        return t
++
++    def receipt(self, txh):
++        t = self.tx(txh)
++        if t is None or t["blockHash"] is None or txh == TX_NO_RECEIPT:
++            return None
++        number, index, _, _, _, _, status, logs = TXS[txh]
++        block_hash = BLOCKS[0x101][0] if txh == TX_MISMATCH else t["blockHash"]
++        return {"transactionHash": txh, "blockHash": block_hash, "blockNumber": hex(number),
++                "transactionIndex": hex(index), "from": SENDER, "status": hex(status),
++                "logs": [{"address": TOKEN, "topics": [], "data": "0x"}] * logs}
++
++    def do_POST(self):
++        length = int(self.headers.get("Content-Length", 0))
++        request = json.loads(self.rfile.read(length))
++        method = request.get("method")
++        params = request.get("params", [])
++        result, error = None, None
++
++        if method == "eth_getBlockByNumber":
++            tag = params[0]
++            if tag == "finalized":
++                result = self.block(FINALIZED)
++                if self.lag:
++                    result = dict(result, number=hex(FINALIZED - 0x80))
++            elif tag == "latest":
++                result = {"number": hex(FINALIZED if self.lag else LATEST), "hash": "0x" + "ee" * 32,
++                          "timestamp": hex(T0 + 0x110 * 12)}
++            else:
++                result = self.block(int(tag, 16))
++        elif method == "eth_getBlockByHash":
++            match = [n for n, (bh, _) in BLOCKS.items() if bh == params[0]]
++            gone = BLOCKS[TXS[TX_BLOCK_GONE][0]][0]
++            result = self.block(match[0]) if match and params[0] != gone else None
++        elif method == "eth_getTransactionByHash":
++            result = self.tx(params[0])
++        elif method == "eth_getTransactionReceipt":
++            result = self.receipt(params[0])
++        else:
++            error = {"code": -32601, "message": "method not found"}
++
++        reply = {"jsonrpc": "2.0", "id": request.get("id")}
++        if error:
++            reply["error"] = error
++        else:
++            reply["result"] = result
++        body = json.dumps(reply).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--port", type=int, required=True)
++    parser.add_argument("--tamper", action="store_true")
++    parser.add_argument("--lag", action="store_true")
++    args = parser.parse_args()
++    Handler.tamper = args.tamper
++    Handler.lag = args.lag
++    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/oracles/read_evm_tx/test/selftest.py b/oracles/read_evm_tx/test/selftest.py
+new file mode 100755
+index 0000000..d11c7cc
+--- /dev/null
++++ b/oracles/read_evm_tx/test/selftest.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++"""Selftest for read_evm_tx_service.py against mock_evm_rpc.py. Run:
++    python3 test/mock_evm_rpc.py --port 18945 &
++    python3 test/mock_evm_rpc.py --port 18946 &
++    python3 test/mock_evm_rpc.py --port 18947 --tamper &
++    python3 test/mock_evm_rpc.py --port 18948 --lag &
++    python3 test/selftest.py           (exit 0 = all pass)
++"""
++
++import os
++import socket
++import struct
++import sys
++import threading
++import urllib.request
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
++
++import read_evm_tx_service as svc
++
++T0 = 0x64000000
++SENDER = bytes(12) + bytes.fromhex("5e" * 20)
++TOKEN = bytes(12) + bytes.fromhex("a0" * 20)
++GOOD = "http://127.0.0.1:18945,http://127.0.0.1:18946"
++
++failures = 0
++
++
++def check(cond, what):
++    global failures
++    print(f"  [{'PASS' if cond else 'FAIL'}] {what}")
++    if not cond:
++        failures += 1
++
++
++def query(chain_id, c):
++    return struct.pack("<Q32s", chain_id, bytes.fromhex(c * 32))
++
++
++def u64(r, off):
++    return struct.unpack("<Q", r[off:off + 8])[0]
++
++
++def run(urls, c, chain_id=1, extra=None):
++    os.environ["EVM_RPC_URLS_1"] = urls
++    for k, v in (extra or {}).items():
++        os.environ[k] = v
++    try:
++        return svc.handle_query(svc.load_chains(), query(chain_id, c))
++    finally:
++        for k in (extra or {}):
++            del os.environ[k]
++
++
++def main():
++    print("SUCCESS (finalized token transfer):")
++    flags, r = run(GOOD, "01")
++    check(flags == svc.NO_ERROR, "service answers")
++    check(len(r) == 192, "reply is 192 bytes")
++    check(u64(r, 0) == svc.SUCCESS, "code == SUCCESS")
++    check(u64(r, 8) == 0x100, "blockNumber")
++    check(u64(r, 16) == T0, "blockTimestamp from the block the receipt names")
++    check(u64(r, 24) == 3, "transactionIndex")
++    check(r[32:64] == bytes.fromhex("b1" * 32), "blockHash")
++    check(r[64:96] == SENDER, "from, right-aligned")
++    check(r[96:128] == TOKEN, "to, right-aligned")
++    check(r[128:160] == bytes(32), "value 0")
++    check(u64(r, 160) == 7 and u64(r, 168) == 1 and u64(r, 176) == 2 and u64(r, 184) == 1,
++          "nonce 7, status 1, type 2, 1 log")
++
++    print("Final facts that are not failures:")
++    flags, r = run(GOOD, "02")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.SUCCESS and u64(r, 168) == 0 and u64(r, 8) == 0x101,
++          "reverted tx: SUCCESS with status 0")
++    flags, r = run(GOOD, "05")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.SUCCESS and r[96:128] == bytes(32),
++          "contract creation: to all zero")
++    check(r[128:160] == (5 * 10**18).to_bytes(32, "big"), "value 5 ETH as uint256 big-endian")
++    check(u64(r, 176) == 0, "legacy tx without a type field: type 0")
++
++    print("Result codes:")
++    flags, r = run(GOOD, "99")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.TX_NOT_FOUND and r[8:] == bytes(184),
++          "unknown tx: code 3, rest zero")
++    flags, r = run(GOOD, "03")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.TX_NOT_FINALIZED and r[8:] == bytes(184),
++          "pending tx: code 4, rest zero")
++    flags, r = run(GOOD, "04")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.TX_NOT_FINALIZED, "mined above the finalized head: code 4")
++    flags, r = run(GOOD, "01", chain_id=8453)
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.CHAIN_UNSUPPORTED, "chain not configured: code 2")
++    flags, r = svc.handle_query(svc.load_chains(), struct.pack("<Q32s", 1, bytes(32)))
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.BAD_QUERY, "zero tx hash: code 1")
++    flags, r = svc.handle_query(svc.load_chains(), bytes(39))
++    check(flags == svc.INVALID_ARG, "wrong payload size: INVALID_ARG flag")
++
++    print("Finality from every endpoint:")
++    flags, r = run("http://127.0.0.1:18945,http://127.0.0.1:18948", "01")
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.SUCCESS, "lagging node that has the tx: still SUCCESS")
++    os.environ["EVM_RPC_URLS_1"] = "http://127.0.0.1:18945"
++    flags, r = run("http://127.0.0.1:18945", "04", extra={"EVM_MIN_CONFIRMATIONS_1": str(0x210 - 0x206)})
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.SUCCESS, "latest - N head (0x206) covers block 0x205")
++    flags, r = run("http://127.0.0.1:18945", "04", extra={"EVM_MIN_CONFIRMATIONS_1": str(0x210 - 0x204)})
++    check(flags == svc.NO_ERROR and u64(r, 0) == svc.TX_NOT_FINALIZED, "latest - N head (0x204) does not")
++
++    print("Abstain (no reply payload committed):")
++    flags, r = run("http://127.0.0.1:18945,http://127.0.0.1:18947", "01")
++    check(flags != svc.NO_ERROR and r == bytes(192), "tampered provider: timestamp disagreement")
++    flags, r = run("http://127.0.0.1:18945,http://127.0.0.1:18948", "04")
++    check(flags != svc.NO_ERROR, "one node knows the tx, the other does not")
++    flags, r = run(GOOD, "06")
++    check(flags != svc.NO_ERROR, "mined tx without a receipt")
++    flags, r = run(GOOD, "07")
++    check(flags != svc.NO_ERROR, "receipt names another block")
++    flags, r = run(GOOD, "08")
++    check(flags != svc.NO_ERROR, "receipt's block not available")
++    flags, r = run("http://127.0.0.1:18945,http://127.0.0.1:1", "01")
++    check(flags != svc.NO_ERROR, "dead endpoint")
++
++    print("Wire protocol (OM node framing over TCP):")
++    os.environ["EVM_RPC_URLS_1"] = GOOD
++    server = svc.Server(("127.0.0.1", 0), svc.Handler)
++    server.chains = svc.load_chains()
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    payload = query(1, "01")
++    size = 8 + 16 + len(payload)
++    frame = bytes([size & 0xFF, (size >> 8) & 0xFF, size >> 16, svc.OM_QUERY_TYPE]) + bytes(4)
++    frame += struct.pack("<QII", 4242, svc.INTERFACE_INDEX, 30000) + payload
++    with socket.create_connection(server.server_address, timeout=10) as s:
++        s.sendall(frame)
++        reply = svc.recv_exact(s, 8 + 16 + 192)
++    check(reply[3] == svc.OM_REPLY_TYPE and struct.unpack("<Q", reply[8:16])[0] == 4242,
++          "reply frame carries type 191 and the query id")
++    check(struct.unpack("<H", reply[16:18])[0] == svc.NO_ERROR and reply[24:32] == bytes(8)
++          and u64(reply[24:], 16) == T0, "no error flags, code SUCCESS, timestamp in place")
++    server.shutdown()
++
++    print(f"{'SELFTEST FAILED' if failures else 'SELFTEST PASSED'} ({failures} failure(s))")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

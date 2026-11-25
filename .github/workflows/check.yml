@@ -14,7 +14,7 @@ jobs:
       # contracts/FeedRegistry.h is checked against the contract rules.
       - uses: qubic/contract-verify@v1.2.5
         with:
-          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/HttpRead.h,contracts/FeedRegistry.h'
+          filepaths: 'oracle_interfaces/ContentRead.h,oracle_interfaces/UtxoTxRead.h,oracle_interfaces/EvmCallRead.h,oracle_interfaces/EvmTxRead.h,oracle_interfaces/HttpRead.h,contracts/FeedRegistry.h'
 
   compile:
     name: compile against qubic/core and check layouts

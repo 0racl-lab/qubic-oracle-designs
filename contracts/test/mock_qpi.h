@@ -180,7 +180,7 @@ namespace QPI
 using QPI::DateAndTime;
 namespace OI
 {
-#define ORACLE_INTERFACE_INDEX 8
+#define ORACLE_INTERFACE_INDEX 9
 #include "../../oracle_interfaces/HttpRead.h"
 #undef ORACLE_INTERFACE_INDEX
 }

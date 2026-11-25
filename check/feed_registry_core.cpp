@@ -20,7 +20,7 @@ namespace QPI
 // HttpRead is a draft in this repo, not yet in core: register it the way oracle_interfaces_def.h would
 namespace OI
 {
-#define ORACLE_INTERFACE_INDEX 8
+#define ORACLE_INTERFACE_INDEX 9
 #include "HttpRead.h"
 #undef ORACLE_INTERFACE_INDEX
 }

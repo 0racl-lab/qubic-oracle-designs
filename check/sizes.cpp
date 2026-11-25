@@ -19,6 +19,9 @@ namespace OI
 #include "EvmCallRead.h"
 #undef ORACLE_INTERFACE_INDEX
 #define ORACLE_INTERFACE_INDEX 8
+#include "EvmTxRead.h"
+#undef ORACLE_INTERFACE_INDEX
+#define ORACLE_INTERFACE_INDEX 9
 #include "HttpRead.h"
 #undef ORACLE_INTERFACE_INDEX
 }
@@ -29,7 +32,7 @@ namespace OI
 #define FITS(I) \
     static_assert(sizeof(OI::I::OracleQuery) <= MAX_ORACLE_QUERY_SIZE, #I " query too large"); \
     static_assert(sizeof(OI::I::OracleReply) <= MAX_ORACLE_REPLY_SIZE, #I " reply too large")
-FITS(ContentRead); FITS(UtxoTxRead); FITS(EvmCallRead); FITS(HttpRead);
+FITS(ContentRead); FITS(UtxoTxRead); FITS(EvmCallRead); FITS(EvmTxRead); FITS(HttpRead);
 
 // exact sizes and offsets documented in the headers (no hidden padding)
 static_assert(sizeof(OI::ContentRead::OracleQuery) == 208 && sizeof(OI::ContentRead::OracleReply) == 536);
@@ -39,6 +42,11 @@ static_assert(sizeof(OI::UtxoTxRead::OracleQuery) == 56 && sizeof(OI::UtxoTxRead
 static_assert(offsetof(OI::UtxoTxRead::OracleReply, value) == 64 && offsetof(OI::UtxoTxRead::OracleReply, script) == 80);
 static_assert(sizeof(OI::EvmCallRead::OracleQuery) == 568 && sizeof(OI::EvmCallRead::OracleReply) == 568);
 static_assert(offsetof(OI::EvmCallRead::OracleQuery, calldata) == 56 && offsetof(OI::EvmCallRead::OracleReply, data) == 56);
+static_assert(sizeof(OI::EvmTxRead::OracleQuery) == 40 && sizeof(OI::EvmTxRead::OracleReply) == 192);
+static_assert(offsetof(OI::EvmTxRead::OracleQuery, txHash) == 8 && offsetof(OI::EvmTxRead::OracleReply, blockTimestamp) == 16);
+static_assert(offsetof(OI::EvmTxRead::OracleReply, blockHash) == 32 && offsetof(OI::EvmTxRead::OracleReply, from) == 64);
+static_assert(offsetof(OI::EvmTxRead::OracleReply, to) == 96 && offsetof(OI::EvmTxRead::OracleReply, value) == 128);
+static_assert(offsetof(OI::EvmTxRead::OracleReply, nonce) == 160 && offsetof(OI::EvmTxRead::OracleReply, logCount) == 184);
 static_assert(sizeof(OI::HttpRead::OracleQuery) == 256 && sizeof(OI::HttpRead::OracleReply) == 160);
 static_assert(offsetof(OI::HttpRead::OracleQuery, timestamp) == 40 && offsetof(OI::HttpRead::OracleQuery, params) == 48);
 static_assert(offsetof(OI::HttpRead::OracleQuery, field) == 176 && offsetof(OI::HttpRead::OracleQuery, decimals) == 248);
@@ -53,6 +61,7 @@ int main()
     printf("ContentRead  query %4zu  reply %4zu  fee %lld..%lld QU\n", sizeof(OI::ContentRead::OracleQuery), sizeof(OI::ContentRead::OracleReply), (long long)f1, (long long)f2);
     printf("UtxoTxRead   query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::UtxoTxRead::OracleQuery), sizeof(OI::UtxoTxRead::OracleReply), (long long)OI::UtxoTxRead::getQueryFee({}));
     printf("EvmCallRead  query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::EvmCallRead::OracleQuery), sizeof(OI::EvmCallRead::OracleReply), (long long)OI::EvmCallRead::getQueryFee({}));
+    printf("EvmTxRead    query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::EvmTxRead::OracleQuery), sizeof(OI::EvmTxRead::OracleReply), (long long)OI::EvmTxRead::getQueryFee({}));
     printf("HttpRead     query %4zu  reply %4zu  fee %lld QU\n", sizeof(OI::HttpRead::OracleQuery), sizeof(OI::HttpRead::OracleReply), (long long)OI::HttpRead::getQueryFee({}));
     printf("limits: query <= %d, reply <= %d bytes\n", (int)MAX_ORACLE_QUERY_SIZE, (int)MAX_ORACLE_REPLY_SIZE);
     return (f1 >= 10 && f2 >= f1) ? 0 : 1;
