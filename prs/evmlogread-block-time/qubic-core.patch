@@ -1,0 +1,154 @@
+From b49383d35fc8148b84482a659bcc76432246348e Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:29:08 +0000
+Subject: [PATCH] EvmLogRead: add blockNumber and blockTimestamp to the reply
+
+A log shows that a transfer happened, not when. A contract that accepts a
+token transfer as payment for an order needs to know it was made after
+the order was opened; otherwise an older, unrelated transfer between the
+same addresses can be claimed. The reply gains two fields at the end:
+
+  blockNumber     uint64 [440..448)  block that includes the transaction
+  blockTimestamp  uint64 [448..456)  that block's timestamp (Unix seconds)
+
+Existing field offsets are unchanged; the reply grows from 440 to 456
+bytes. getBlockDateAndTime() converts the timestamp to a QPI DateAndTime
+for comparison with qpi.now(). Tests pin the new size and offsets and
+cover the conversion.
+
+Needs the matching oracle-machine read_evm_log change (same reply size),
+deployed together with this core release.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ src/oracle_interfaces/EvmLogRead.h | 27 +++++++++++++++++---
+ test/oracle_engine.cpp             | 40 +++++++++++++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/src/oracle_interfaces/EvmLogRead.h b/src/oracle_interfaces/EvmLogRead.h
+index 1ab2ed6..07d0d45 100644
+--- a/src/oracle_interfaces/EvmLogRead.h
++++ b/src/oracle_interfaces/EvmLogRead.h
+@@ -5,16 +5,23 @@ using namespace QPI;
+ *
+ * Generic cross-chain read of a SINGLE event log from a FINALIZED EVM receipt. Given
+ * (chainId, txHash, logIndex) the oracle machine returns that one log verbatim: the emitter
+-* address, its topics and its data, as RAW bytes. No event/ABI semantics are baked in here -
++* address, its topics and its data, as RAW bytes, plus the number and timestamp of the block
++* that includes the transaction. No event/ABI semantics are baked in here -
+ * this interface knows nothing about tokens, amounts or any specific event; the querying smart
+ * contract decodes the raw log itself.
+ *
+ * Determinism requirement (see Price.h): the oracle machine MUST only answer from receipts at or
+ * below the chain's finalized block (RESULT_TX_NOT_FINALIZED otherwise) and MUST zero all reply
+ * value fields except code on failure, so replies are byte-identical across computors.
++* blockTimestamp MUST be read from the block the receipt names (fetched by its hash), so every
++* machine reports the same block's time.
++*
++* Why the block time: a log alone shows that a transfer happened, not when. A contract that accepts
++* a token transfer as payment for an order needs to know the transfer was made after the order was
++* opened, otherwise an older, unrelated transfer between the same addresses could be claimed.
+ *
+ * This is the generic read_evm_log service contract. Byte layout mirrors oracle-machine
+-* oracles/read_evm_log (48-byte query, 440-byte reply).
++* oracles/read_evm_log (48-byte query, 456-byte reply).
+ */
+ struct EvmLogRead
+ {
+@@ -80,7 +87,7 @@ struct EvmLogRead
+         uint64 logIndex;         // [40..48)
+     };
+ 
+-    /// Oracle reply data / output of the oracle machine. Fixed 440 bytes.
++    /// Oracle reply data / output of the oracle machine. Fixed 456 bytes.
+     /// On failure (code != RESULT_SUCCESS) all other fields MUST be all-zero so the reply is
+     /// canonical across computors.
+     struct OracleReply
+@@ -102,6 +109,12 @@ struct EvmLogRead
+ 
+         /// The log data, raw bytes, zero-padded beyond dataLen.
+         Array<uint8, 256> data;         // [184..440)
++
++        /// Number of the block that includes the transaction.
++        uint64 blockNumber;             // [440..448)
++
++        /// That block's timestamp, in seconds since 1970-01-01 UTC (see getBlockDateAndTime).
++        uint64 blockTimestamp;          // [448..456)
+     };
+ 
+     /// Return query fee. Cross-chain EVM reads are comparatively expensive.
+@@ -118,4 +131,12 @@ struct EvmLogRead
+     {
+         return reply.code == RESULT_SUCCESS;
+     }
++
++    /// Block time as a QPI DateAndTime (UTC), to compare with qpi.now() or a stored DateAndTime.
++    /// Returns false if the reply is not a success or the time is out of DateAndTime's range.
++    static bool getBlockDateAndTime(const OracleReply& reply, DateAndTime& out)
++    {
++        out = DateAndTime(1970, 1, 1, 0, 0, 0);
++        return reply.code == RESULT_SUCCESS && out.add(0, 0, 0, 0, 0, (sint64)reply.blockTimestamp);
++    }
+ };
+diff --git a/test/oracle_engine.cpp b/test/oracle_engine.cpp
+index 15c2ab2..0a340a7 100644
+--- a/test/oracle_engine.cpp
++++ b/test/oracle_engine.cpp
+@@ -1944,7 +1944,10 @@ TEST(EvmLogReadOracle, DataContract)
+ 
+ 	// pinned sizes (no padding holes -> canonical bytes for the reply digest)
+ 	EXPECT_EQ(sizeof(EvmLogRead::OracleQuery), 48u);
+-	EXPECT_EQ(sizeof(EvmLogRead::OracleReply), 440u);
++	EXPECT_EQ(sizeof(EvmLogRead::OracleReply), 456u);
++	EXPECT_EQ(offsetof(EvmLogRead::OracleReply, data), 184u);
++	EXPECT_EQ(offsetof(EvmLogRead::OracleReply, blockNumber), 440u);
++	EXPECT_EQ(offsetof(EvmLogRead::OracleReply, blockTimestamp), 448u);
+ 
+ 	// registry size table matches the actual structs
+ 	EXPECT_EQ(OI::oracleInterfaces[EvmLogRead::oracleInterfaceIndex].querySize, sizeof(EvmLogRead::OracleQuery));
+@@ -2029,6 +2032,41 @@ TEST(EvmLogReadOracle, ResultCodes)
+ 	EXPECT_FALSE(E::replyIsValid(reply));
+ }
+ 
++// The block time converts to a QPI DateAndTime that compares with qpi.now()-style values, e.g. to accept
++// a transfer only if it was made after an order was opened.
++TEST(EvmLogReadOracle, BlockTimeAsDateAndTime)
++{
++	using E = OI::EvmLogRead;
++
++	E::OracleReply reply{};
++	reply.code = E::RESULT_SUCCESS;
++	QPI::DateAndTime t;
++
++	reply.blockTimestamp = 1700000000;              // 2023-11-14 22:13:20 UTC
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_EQ(t.getYear(), 2023);
++	EXPECT_EQ(t.getMonth(), 11);
++	EXPECT_EQ(t.getDay(), 14);
++	EXPECT_EQ(t.getHour(), 22);
++	EXPECT_EQ(t.getMinute(), 13);
++	EXPECT_EQ(t.getSecond(), 20);
++	EXPECT_TRUE(t == QPI::DateAndTime(2023, 11, 14, 22, 13, 20));
++
++	reply.blockTimestamp = 1709251199;              // 2024-02-29 23:59:59 UTC (leap day)
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_TRUE(t == QPI::DateAndTime(2024, 2, 29, 23, 59, 59));
++	QPI::DateAndTime opened(2024, 3, 1, 0, 0, 0);
++	EXPECT_TRUE(t < opened);                        // a transfer one second before an order opened
++
++	reply.blockTimestamp = 0;
++	ASSERT_TRUE(E::getBlockDateAndTime(reply, t));
++	EXPECT_TRUE(t == QPI::DateAndTime(1970, 1, 1, 0, 0, 0));
++
++	reply.blockTimestamp = 1700000000;
++	reply.code = E::RESULT_TX_NOT_FINALIZED;        // no time from a failed reply
++	EXPECT_FALSE(E::getBlockDateAndTime(reply, t));
++}
++
+ // Two queries built with identical logical values must serialize to identical bytes. This guards the
+ // determinism requirement: every computor must produce the exact same query bytes (and therefore the
+ // OM must produce the exact same reply digest), so no padding byte may be left uninitialized.
+-- 
+2.43.0
+

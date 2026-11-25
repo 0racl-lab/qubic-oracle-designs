@@ -90,6 +90,8 @@ A transaction in a finalized block never moves, and its block's timestamp never 
 - It fits the existing pattern of one small interface per job: a 40-byte query and a 192-byte reply.
 - It's useful on its own, for native coin payments, deadlines and sender checks, with no log involved.
 
+The other route is also prepared: a [pull request](../prs/evmlogread-block-time/) that appends `blockNumber` and `blockTimestamp` to EvmLogRead's reply, keeping every existing offset. For the token-payment case it needs one query instead of two. It changes the reply size, so core and oracle-machine have to be released together. Either one closes the gap, and the oracle team can pick.
+
 ## Limits
 
 - **No input data.** The calldata isn't returned; use EvmLogRead for what a transaction did.

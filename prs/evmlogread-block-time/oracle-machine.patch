@@ -1,0 +1,301 @@
+From caddd3daa54945674020dbb9c98a62178dbf6e39 Mon Sep 17 00:00:00 2001
+From: 0racl-lab <360770237+0racl-lab@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:30:21 +0000
+Subject: [PATCH] read_evm_log: return blockNumber and blockTimestamp
+
+Matches the qubic/core EvmLogRead change that appends two fields to the
+reply (440 -> 456 bytes):
+
+  blockNumber     uint64 [440..448)  block that includes the transaction
+  blockTimestamp  uint64 [448..456)  that block's timestamp (Unix seconds)
+
+The timestamp is read from the block the receipt names, fetched by hash
+on every endpoint; the block's hash and number must match the receipt and
+every endpoint must report the same timestamp, otherwise the service
+abstains. Existing fields and result codes are unchanged.
+
+Selftest: checks the new fields, abstains when providers disagree only on
+the timestamp (new --tamper-time mock flag) or cannot return the block.
+Deploy together with the core release that carries the new reply size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHXGjDwxBARUytE2smA8oq
+---
+ oracles/read_evm_log/README.md               | 10 ++++-
+ oracles/read_evm_log/read_evm_log_service.py | 39 +++++++++++++++++---
+ oracles/read_evm_log/test/mock_evm_rpc.py    | 26 ++++++++++++-
+ oracles/read_evm_log/test/selftest.py        | 15 +++++++-
+ 4 files changed, 78 insertions(+), 12 deletions(-)
+
+diff --git a/oracles/read_evm_log/README.md b/oracles/read_evm_log/README.md
+index 38cb00e..671abe5 100644
+--- a/oracles/read_evm_log/README.md
++++ b/oracles/read_evm_log/README.md
+@@ -1,7 +1,8 @@
+ # read_evm_log oracle service
+ 
+ Generic **EVM &rarr; Qubic** oracle. Given `(chainId, txHash, logIndex)` it returns exactly one
+-receipt log — emitter address, topics and data — as **raw bytes**. No event ABI is baked in: any
++receipt log — emitter address, topics and data — as **raw bytes**, plus the number and timestamp
++of the block that includes the transaction. No event ABI is baked in: any
+ contract's log is served and the querying Qubic smart contract decodes its own semantics.
+ 
+ Implemented in Python (`read_evm_log_service.py`, stdlib only). It listens on
+@@ -18,7 +19,7 @@ config change, not a code change.
+ | 8      | 32   | `txHash`   | transaction hash                                 |
+ | 40     | 8    | `logIndex` | uint64 LE, **receipt-local** index into the tx's own logs |
+ 
+-### Reply — 440 bytes (`EvmReadReply`)
++### Reply — 456 bytes (`EvmReadReply`)
+ 
+ | offset | size | field        | notes                                             |
+ |-------:|-----:|--------------|---------------------------------------------------|
+@@ -28,6 +29,8 @@ config change, not a code change.
+ | 48     | 128  | `topics`     | `uint8[4][32]`, zero-padded                       |
+ | 176    | 8    | `dataLen`    | uint64 LE length of `data`                        |
+ | 184    | 256  | `data`       | log data, zero-padded                             |
++| 440    | 8    | `blockNumber`    | uint64 LE, block that includes the transaction |
++| 448    | 8    | `blockTimestamp` | uint64 LE, that block's timestamp (Unix seconds) |
+ 
+ On any non-zero `code`, **all value fields are zero** (canonical failure form, so every computor
+ commits identical bytes).
+@@ -66,6 +69,8 @@ Run: `python3 read_evm_log_service.py` (Python 3.8+, no third-party packages).
+   reported by *every* configured endpoint. The service never reads `latest`.
+ - **Multi-provider byte-agreement.** Every read queries all endpoints of the chain and requires
+   byte-identical normalized results.
++- **Timestamp of the receipt's block.** The block is fetched by the hash the receipt names, its
++  hash and number must match the receipt, and every endpoint must report the same timestamp.
+ - **Abstain on disagreement.** Any endpoint failure or disagreement yields a transport error and no
+   commit — the oracle abstains rather than risk a non-reproducible reply.
+ - **Deterministic facts are answered** with a result code and zeroed value fields (chain
+@@ -85,5 +90,6 @@ No service code changes are required.
+ python3 test/mock_evm_rpc.py --port 18545 &
+ python3 test/mock_evm_rpc.py --port 18546 &
+ python3 test/mock_evm_rpc.py --port 18547 --tamper &
++python3 test/mock_evm_rpc.py --port 18548 --tamper-time &
+ python3 test/selftest.py     # exit 0 = all scenarios pass
+ ```
+diff --git a/oracles/read_evm_log/read_evm_log_service.py b/oracles/read_evm_log/read_evm_log_service.py
+index 66b68b4..ec59bd1 100644
+--- a/oracles/read_evm_log/read_evm_log_service.py
++++ b/oracles/read_evm_log/read_evm_log_service.py
+@@ -2,13 +2,15 @@
+ """read_evm_log oracle service (interface index 3): generic single-log EVM read.
+ 
+ Query 48B: chainId u64 LE | txHash 32B | logIndex u64 LE (receipt-local).
+-Reply 440B: code u64 | address 32B | topicCount u64 | topics 4x32B | dataLen u64 | data 256B.
+-Only finalized logs are answered; all configured RPC endpoints must agree byte-for-byte,
+-otherwise the service abstains (oracle error flag, no reply payload).
++Reply 456B: code u64 | address 32B | topicCount u64 | topics 4x32B | dataLen u64 | data 256B |
++            blockNumber u64 | blockTimestamp u64.
++Only finalized logs are answered; all configured RPC endpoints must agree byte-for-byte (the
++receipt, and the timestamp of the block it names), otherwise the service abstains (oracle error
++flag, no reply payload).
+ 
+ Speaks the OM node <-> service protocol of oracles/core/base_oracle_service.cpp:
+   query:  header 8B (size LE24 | type=190 | dejavu u32) | OracleMachineQuery 16B | payload 48B
+-  reply:  header 8B (size LE24 | type=191 | dejavu=0)   | OracleMachineReply 16B | payload 440B
++  reply:  header 8B (size LE24 | type=191 | dejavu=0)   | OracleMachineReply 16B | payload 456B
+ 
+ Env: READ_EVM_LOG_SERVICE_PORT (default 9005), EVM_RPC_URLS_<chainId> (comma-separated),
+ EVM_MIN_CONFIRMATIONS_<chainId> (optional: latest-N instead of the "finalized" tag).
+@@ -24,7 +26,7 @@ import sys
+ import urllib.request
+ 
+ QUERY_SIZE = 48
+-REPLY_SIZE = 440
++REPLY_SIZE = 456
+ OM_QUERY_TYPE = 190
+ OM_REPLY_TYPE = 191
+ MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024
+@@ -134,12 +136,31 @@ def get_receipt(chain, tx_hash_hex):
+     return receipt, finalized
+ 
+ 
++def block_timestamp(chain, receipt):
++    """Timestamp of the block the receipt names, fetched by hash; every endpoint must agree."""
++    agreed = None
++    for endpoint in chain["endpoints"]:
++        block = rpc(endpoint, "eth_getBlockByHash", ["0x" + receipt["blockHash"].hex(), False])
++        if not isinstance(block, dict):
++            raise ValueError("block of the receipt not available")
++        if hexb(block["hash"]) != receipt["blockHash"] or int(block["number"], 16) != receipt["blockNumber"]:
++            raise ValueError("block does not match the receipt")
++        timestamp = int(block["timestamp"], 16)
++        if agreed is None:
++            agreed = timestamp
++        elif timestamp != agreed:
++            raise ValueError("provider disagreement on block timestamp")
++    if agreed >= 1 << 64 or receipt["blockNumber"] >= 1 << 64:
++        raise ValueError("block number or timestamp does not fit in 64 bits")
++    return agreed
++
++
+ def code_reply(code):
+     return struct.pack("<Q", code) + bytes(REPLY_SIZE - 8)
+ 
+ 
+ def handle_query(chains, payload):
+-    """48B query payload -> (errorFlags, 440B reply payload). Abstains via non-zero flags."""
++    """48B query payload -> (errorFlags, 456B reply payload). Abstains via non-zero flags."""
+     if len(payload) != QUERY_SIZE:
+         return INVALID_ARG, bytes(REPLY_SIZE)
+     chain_id, tx_hash, log_index = struct.unpack("<Q32sQ", payload)
+@@ -167,6 +188,11 @@ def handle_query(chains, payload):
+         return NO_ERROR, code_reply(LOG_DATA_TOO_LARGE)
+     if len(log["topics"]) > 4:
+         return ORACLE_UNAVAIL, bytes(REPLY_SIZE)  # impossible on honest EVM (LOG0..LOG4)
++    try:
++        timestamp = block_timestamp(chains[chain_id], receipt)
++    except Exception as e:
++        print(f"[ReadEvmLog] abstain: {e}", file=sys.stderr)
++        return ORACLE_UNAVAIL, bytes(REPLY_SIZE)
+ 
+     reply = struct.pack("<Q", SUCCESS)
+     reply += bytes(12) + log["address"]  # 20-byte emitter right-aligned into 32 bytes
+@@ -176,6 +202,7 @@ def handle_query(chains, payload):
+     reply += bytes(32) * (4 - len(log["topics"]))
+     reply += struct.pack("<Q", len(log["data"]))
+     reply += log["data"] + bytes(256 - len(log["data"]))
++    reply += struct.pack("<QQ", receipt["blockNumber"], timestamp)
+     assert len(reply) == REPLY_SIZE
+     return NO_ERROR, reply
+ 
+diff --git a/oracles/read_evm_log/test/mock_evm_rpc.py b/oracles/read_evm_log/test/mock_evm_rpc.py
+index 24260a8..f2dab3b 100644
+--- a/oracles/read_evm_log/test/mock_evm_rpc.py
++++ b/oracles/read_evm_log/test/mock_evm_rpc.py
+@@ -3,7 +3,7 @@
+ 
+ Serves canned eth_getTransactionReceipt / eth_getBlockByNumber / eth_getBlockByHash
+ responses. Run one instance per fake "provider"; --tamper alters one data word so
+-provider-disagreement handling can be tested.
++provider-disagreement handling can be tested, --tamper-time alters only a block timestamp.
+ 
+ Usage: mock_evm_rpc.py --port 18545 [--tamper]
+ """
+@@ -27,6 +27,9 @@ TX_E = "0x" + "aa" * 31 + "06"  # finalized, log data > 256 bytes
+ TX_F = "0x" + "aa" * 31 + "07"  # finalized, malformed 5-topic log
+ 
+ FINALIZED_HEAD = "0x1ff"
++BLOCK_TIME = 0x64000000                # timestamp of every canned block
++TX_G = "0x" + "aa" * 31 + "08"  # finalized, but the node can't return its block
++BLOCK_GONE = "0x" + "d2" * 32
+ 
+ VALUE_1M = "0x" + "00" * 28 + "000f4240"  # 1_000_000 as a 32-byte word
+ 
+@@ -82,6 +85,18 @@ def receipts(tamper: bool):
+                 },
+             ],
+         },
++        TX_G: {
++            "status": "0x1",
++            "blockNumber": "0x101",
++            "blockHash": BLOCK_GONE,
++            "logs": [
++                {
++                    "address": EMITTER,
++                    "topics": [TRANSFER_TOPIC, FROM_PADDED, TO_PADDED],
++                    "data": VALUE_1M,
++                },
++            ],
++        },
+         TX_D: {
+             "status": "0x0",  # reverted (finalized block, provider still lists a log)
+             "blockNumber": "0x100",
+@@ -99,6 +114,7 @@ def receipts(tamper: bool):
+ 
+ class Handler(BaseHTTPRequestHandler):
+     tamper = False
++    tamper_time = False
+ 
+     def log_message(self, fmt, *args):  # quiet
+         pass
+@@ -116,7 +132,11 @@ class Handler(BaseHTTPRequestHandler):
+             if params[0] in ("finalized", "latest"):
+                 result = {"number": FINALIZED_HEAD, "timestamp": "0x64000000"}
+         elif method == "eth_getBlockByHash":
+-            result = {"number": "0x100", "timestamp": "0x64000000"}
++            # every canned receipt's block, by hash; "0xd2..." is a block this node can't serve
++            numbers = {r["blockHash"]: r["blockNumber"] for r in receipts(False).values()}
++            if params[0] in numbers and params[0] != BLOCK_GONE:
++                timestamp = BLOCK_TIME + (1 if self.tamper_time else 0)
++                result = {"hash": params[0], "number": numbers[params[0]], "timestamp": hex(timestamp)}
+ 
+         body = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}).encode()
+         self.send_response(200)
+@@ -130,8 +150,10 @@ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--port", type=int, required=True)
+     parser.add_argument("--tamper", action="store_true")
++    parser.add_argument("--tamper-time", action="store_true")
+     args = parser.parse_args()
+     Handler.tamper = args.tamper
++    Handler.tamper_time = args.tamper_time
+     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+ 
+ 
+diff --git a/oracles/read_evm_log/test/selftest.py b/oracles/read_evm_log/test/selftest.py
+index a248e5f..9bae69a 100644
+--- a/oracles/read_evm_log/test/selftest.py
++++ b/oracles/read_evm_log/test/selftest.py
+@@ -3,6 +3,7 @@
+     python3 test/mock_evm_rpc.py --port 18545 &
+     python3 test/mock_evm_rpc.py --port 18546 &
+     python3 test/mock_evm_rpc.py --port 18547 --tamper &
++    python3 test/mock_evm_rpc.py --port 18548 --tamper-time &
+     python3 test/selftest.py           (exit 0 = all pass)
+ """
+ 
+@@ -22,6 +23,7 @@ TX_C = bytes.fromhex("aa" * 31 + "03")  # not yet finalized
+ TX_E = bytes.fromhex("aa" * 31 + "06")  # oversized log data
+ TX_F = bytes.fromhex("aa" * 31 + "07")  # malformed 5-topic log
+ TX_D = bytes.fromhex("aa" * 31 + "04")  # reverted
++TX_G = bytes.fromhex("aa" * 31 + "08")  # finalized, but its block can't be fetched
+ TRANSFER_TOPIC = bytes.fromhex("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+ EMITTER = bytes.fromhex("dac17f958d2ee523a2206206994597c13d831ec7")
+ VALUE_1M = bytes(28) + bytes.fromhex("000f4240")
+@@ -47,7 +49,7 @@ def main():
+     print("SUCCESS (raw log echoed):")
+     flags, r = svc.handle_query(chains, query(1, TX_A, 0))
+     check(flags == svc.NO_ERROR, "finalized tx: service answers")
+-    check(len(r) == 440, "reply is 440 bytes")
++    check(len(r) == 456, "reply is 456 bytes")
+     check(struct.unpack("<Q", r[0:8])[0] == svc.SUCCESS, "code == SUCCESS")
+     check(r[8:40] == bytes(12) + EMITTER, "emitter right-aligned, upper 12 zero")
+     check(struct.unpack("<Q", r[40:48])[0] == 3, "topicCount == 3")
+@@ -58,6 +60,8 @@ def main():
+     check(struct.unpack("<Q", r[176:184])[0] == 32, "dataLen == 32")
+     check(r[184:216] == VALUE_1M, "data byte-exact")
+     check(r[216:440] == bytes(224), "data tail zero-padded")
++    check(struct.unpack("<Q", r[440:448])[0] == 0x100, "blockNumber of the receipt")
++    check(struct.unpack("<Q", r[448:456])[0] == 0x64000000, "blockTimestamp of that block")
+ 
+     print("Result codes:")
+     flags, r = svc.handle_query(chains, query(1, TX_B, 0))
+@@ -65,7 +69,7 @@ def main():
+     flags, r = svc.handle_query(chains, query(1, TX_C, 0))
+     check(flags == svc.NO_ERROR and r[0] == svc.TX_NOT_FINALIZED, "unfinalized tx: code 4")
+     flags, r = svc.handle_query(chains, query(1, TX_D, 0))
+-    check(flags == svc.NO_ERROR and r[0] == svc.TX_NOT_FINALIZED and r[8:] == bytes(432),
++    check(flags == svc.NO_ERROR and r[0] == svc.TX_NOT_FINALIZED and r[8:] == bytes(448),
+           "reverted tx: code 4, log never served")
+     flags, r = svc.handle_query(chains, query(1, TX_A, 5))
+     check(flags == svc.NO_ERROR and r[0] == svc.LOG_INDEX_OUT_OF_RANGE, "log index 5: code 5")
+@@ -85,6 +89,13 @@ def main():
+     flags, r = svc.handle_query(svc.load_chains(), query(1, TX_A, 0))
+     check(flags != svc.NO_ERROR, "tampered provider: no answer (oracle error flag)")
+ 
++    os.environ["EVM_RPC_URLS_1"] = "http://127.0.0.1:18545,http://127.0.0.1:18548"
++    flags, r = svc.handle_query(svc.load_chains(), query(1, TX_A, 0))
++    check(flags != svc.NO_ERROR and r == bytes(456), "providers disagree only on block timestamp: no answer")
++    os.environ["EVM_RPC_URLS_1"] = "http://127.0.0.1:18545,http://127.0.0.1:18546"
++    flags, r = svc.handle_query(svc.load_chains(), query(1, TX_G, 0))
++    check(flags != svc.NO_ERROR, "receipt's block not available: no answer")
++
+     print("Endpoint down (abstain):")
+     os.environ["EVM_RPC_URLS_1"] = "http://127.0.0.1:18545,http://127.0.0.1:1"
+     flags, r = svc.handle_query(svc.load_chains(), query(1, TX_A, 0))
+-- 
+2.43.0
+

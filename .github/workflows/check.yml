@@ -46,3 +46,11 @@ jobs:
           path: .core
       - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
       - run: MUTATIONS=1 check/contract.sh
+
+  evmlogread-pr:
+    name: EvmLogRead block-time PR (core develop + oracle-machine main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+      - run: check/evmlogread_pr.sh

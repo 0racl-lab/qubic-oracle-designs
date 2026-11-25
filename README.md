@@ -10,6 +10,7 @@ Proposed oracle interfaces for [Qubic](https://qubic.org). Four are implemented 
 | [**UtxoTxRead**](designs/utxo-tx-read.md) | Read one output of a confirmed **Dogecoin**, Bitcoin or Litecoin transaction | **Implemented:** core interface 6 + `read_utxo_tx` service | 1,000 QU |
 | [**ContentRead**](designs/content-read.md) | Read a file by its SHA-256 hash: size, byte range or one JSON field | **Implemented:** core interface 7 + `read_content` service | 60–690 QU |
 | [**EvmTxRead**](designs/evm-tx-read.md) | When and by whom an EVM transaction happened: block, timestamp, sender, value, status | **Implemented:** core interface 8 + `read_evm_tx` service | 1,000 QU |
+| [EvmLogRead block time](prs/evmlogread-block-time/) | Pull request: add block number and timestamp to Qubic's existing EvmLogRead reply | **Ready to open:** core + oracle-machine patches | unchanged |
 | [**HttpRead**](designs/http-read.md) | Read one value from an approved public web API | Plan + draft header | 200 QU |
 | [**FeedRegistry**](designs/http-read.md#feeds-governed-by-a-registry-contract) | Web feeds voted in by shareholders and read through HttpRead | Contract sketch + 53 tests | Oracle fee + feed fee |
 
@@ -81,6 +82,7 @@ check/implementation.sh    # clones both upstream repos, applies the patches, ru
 check/check.sh             # compiles all five headers against qubic/core, checks sizes and offsets
 check/contract.sh          # FeedRegistry: type-check against qubic/core, 53 native tests, contract-verify
 MUTATIONS=1 check/contract.sh   # ... plus the mutation check (114 deliberate bugs, each must fail a test)
+check/evmlogread_pr.sh     # EvmLogRead block-time PR: core develop + oracle-machine main, tests and selftest
 ```
 
 `implementation.sh` does five things:
@@ -93,7 +95,7 @@ MUTATIONS=1 check/contract.sh   # ... plus the mutation check (114 deliberate bu
 
 `contract.sh` type-checks the contract against core's real QPI headers. The tests themselves run against `contracts/test/mock_qpi.h`, a small simulation of QPI: balances, burns, dividends, shareholder voting with core's 2/3 quorum rule, the hash map, dates and the HttpRead oracle (queries, fees and callbacks). Building a contract inside core needs MSVC.
 
-CI runs all three scripts (with the mutation check) plus the official [contract-verify](https://github.com/qubic/contract-verify) action on every push.
+CI runs all four scripts (with the mutation check) plus the official [contract-verify](https://github.com/qubic/contract-verify) action on every push.
 
 Last local run:
 
@@ -129,6 +131,7 @@ Oracle interfaces don't go through a computor proposal or an IPO. Per core's [or
 designs/              one design note per oracle: purpose, how it works, rules, limits, tests, open questions
 oracle_interfaces/    the interface headers (drop-in format for qubic/core src/oracle_interfaces/)
 patches/              git format-patch series for qubic/core and qubic/oracle-machine (apply in order)
+prs/                  stand-alone pull requests to existing Qubic code, with patches and PR descriptions
 contracts/            FeedRegistry.h (contract sketch); test/ holds its native tests, QPI mock and mutation list
 check/                check.sh (headers vs core), implementation.sh (patches + all tests), contract.sh (FeedRegistry)
 .github/workflows/    CI
